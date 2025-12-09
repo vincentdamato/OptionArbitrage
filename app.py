@@ -315,8 +315,8 @@ if ticker:
 # Footer
 st.markdown("---")
 st.markdown(
-    '<p style="text-align: center; color: #9ca3af; font-size: 0.875rem;">'
-    'Data provided by Yahoo Finance • For educational purposes only'
+    '<p style="text-align: center; color: #9ca3af; font-size: 0.8rem;">'
+    '@vincentdamato'
     '</p>',
     unsafe_allow_html=True
 )
