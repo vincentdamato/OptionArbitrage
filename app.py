@@ -1,14 +1,16 @@
 """
 Options Screener - Professional Options Grid
-Real-time options chain with calls/puts grid layout
+Real-time options chain with Tradier API + yfinance fallback
 """
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import time
+import requests
+from typing import Optional, Tuple, Dict, List
+import os
 
 # Page configuration
 st.set_page_config(
@@ -18,7 +20,25 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Professional trading terminal CSS
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Tradier API Configuration
+# Get your free API key at: https://developer.tradier.com/
+# For sandbox (delayed): use 'sandbox.tradier.com' 
+# For live (real-time): use 'api.tradier.com'
+
+TRADIER_API_KEY = os.environ.get("TRADIER_API_KEY", "")
+TRADIER_ENDPOINT = os.environ.get("TRADIER_ENDPOINT", "https://sandbox.tradier.com/v1")
+
+# Set to True to use Tradier when API key is available
+USE_TRADIER = bool(TRADIER_API_KEY)
+
+# ============================================================================
+# STYLING
+# ============================================================================
+
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
@@ -37,6 +57,7 @@ st.markdown("""
         --accent-red-dim: #991b1b;
         --accent-blue: #3b82f6;
         --accent-yellow: #eab308;
+        --accent-orange: #f97316;
         --itm-bg: rgba(34, 197, 94, 0.08);
         --otm-bg: transparent;
         --atm-bg: rgba(59, 130, 246, 0.12);
@@ -51,11 +72,9 @@ st.markdown("""
         color: var(--text-primary);
     }
     
-    /* Hide Streamlit branding */
     #MainMenu, footer, header {visibility: hidden;}
     .stDeployButton {display: none;}
     
-    /* Header styling */
     .terminal-header {
         display: flex;
         align-items: center;
@@ -88,6 +107,14 @@ st.markdown("""
         color: var(--accent-green);
     }
     
+    .delayed-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.75rem;
+        color: var(--accent-orange);
+    }
+    
     .live-dot {
         width: 8px;
         height: 8px;
@@ -96,12 +123,18 @@ st.markdown("""
         animation: pulse 2s infinite;
     }
     
+    .delayed-dot {
+        width: 8px;
+        height: 8px;
+        background: var(--accent-orange);
+        border-radius: 50%;
+    }
+    
     @keyframes pulse {
         0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
         50% { opacity: 0.8; box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
     }
     
-    /* Stock info bar */
     .stock-bar {
         display: flex;
         align-items: center;
@@ -111,6 +144,7 @@ st.markdown("""
         border: 1px solid var(--border-color);
         border-radius: 8px;
         margin-bottom: 1.5rem;
+        flex-wrap: wrap;
     }
     
     .stock-symbol {
@@ -155,29 +189,30 @@ st.markdown("""
         letter-spacing: 0.05em;
     }
     
-    /* Options grid container */
     .grid-container {
         background: var(--bg-secondary);
         border: 1px solid var(--border-color);
         border-radius: 8px;
         overflow: hidden;
+        overflow-x: auto;
     }
     
     .grid-header {
         display: grid;
-        grid-template-columns: 1fr auto 1fr;
+        grid-template-columns: 1fr 100px 1fr;
         background: var(--bg-tertiary);
         border-bottom: 1px solid var(--border-color);
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.05em;
+        min-width: 900px;
     }
     
     .grid-header-calls, .grid-header-puts {
         display: grid;
-        grid-template-columns: repeat(6, 1fr);
-        padding: 0.75rem 1rem;
+        grid-template-columns: repeat(7, 1fr);
+        padding: 0.75rem 0.5rem;
     }
     
     .grid-header-calls {
@@ -191,28 +226,28 @@ st.markdown("""
     }
     
     .grid-header-strike {
-        padding: 0.75rem 1rem;
+        padding: 0.75rem 0.5rem;
         text-align: center;
         color: var(--accent-blue);
         background: rgba(59, 130, 246, 0.1);
-        min-width: 100px;
     }
     
     .grid-header span {
         text-align: right;
+        padding: 0 0.25rem;
     }
     
     .grid-header span:first-child {
         text-align: left;
     }
     
-    /* Grid rows */
     .grid-row {
         display: grid;
-        grid-template-columns: 1fr auto 1fr;
+        grid-template-columns: 1fr 100px 1fr;
         border-bottom: 1px solid var(--border-color);
-        font-size: 0.8125rem;
+        font-size: 0.75rem;
         transition: background 0.15s ease;
+        min-width: 900px;
     }
     
     .grid-row:hover {
@@ -239,14 +274,16 @@ st.markdown("""
     
     .calls-data, .puts-data {
         display: grid;
-        grid-template-columns: repeat(6, 1fr);
-        padding: 0.5rem 1rem;
+        grid-template-columns: repeat(7, 1fr);
+        padding: 0.4rem 0.5rem;
         align-items: center;
     }
     
     .calls-data span, .puts-data span {
         text-align: right;
         color: var(--text-secondary);
+        padding: 0 0.25rem;
+        white-space: nowrap;
     }
     
     .calls-data span:first-child, .puts-data span:first-child {
@@ -254,12 +291,11 @@ st.markdown("""
     }
     
     .strike-cell {
-        padding: 0.5rem 1rem;
+        padding: 0.4rem 0.5rem;
         text-align: center;
         font-weight: 600;
         color: var(--text-primary);
         background: var(--bg-tertiary);
-        min-width: 100px;
     }
     
     .bid-ask {
@@ -275,62 +311,56 @@ st.markdown("""
         color: var(--accent-blue) !important;
     }
     
-    /* Expiration selector */
-    .exp-container {
-        display: flex;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-        flex-wrap: wrap;
+    .delta-col {
+        color: var(--accent-blue) !important;
     }
     
-    .exp-btn {
-        padding: 0.5rem 1rem;
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 6px;
-        color: var(--text-secondary);
-        font-size: 0.75rem;
-        cursor: pointer;
-        transition: all 0.15s ease;
+    .stats-row {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 0.75rem;
+        margin-bottom: 1.5rem;
     }
     
-    .exp-btn:hover {
-        border-color: var(--accent-blue);
-        color: var(--text-primary);
-    }
-    
-    .exp-btn.active {
-        background: var(--accent-blue);
-        border-color: var(--accent-blue);
-        color: white;
-    }
-    
-    /* Controls bar */
-    .controls-bar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 1rem;
-        padding: 0.75rem 1rem;
+    .stat-card {
         background: var(--bg-secondary);
         border: 1px solid var(--border-color);
         border-radius: 8px;
+        padding: 0.875rem;
+        text-align: center;
     }
     
-    .filter-group {
-        display: flex;
-        gap: 1rem;
-        align-items: center;
+    .stat-value {
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: var(--text-primary);
     }
     
-    .filter-label {
-        font-size: 0.75rem;
+    .stat-label {
+        font-size: 0.625rem;
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.05em;
+        margin-top: 0.25rem;
     }
     
-    /* Streamlit overrides */
+    .timestamp {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        text-align: right;
+        margin-top: 0.5rem;
+    }
+    
+    .data-source {
+        display: inline-block;
+        padding: 0.25rem 0.5rem;
+        background: var(--bg-tertiary);
+        border-radius: 4px;
+        font-size: 0.625rem;
+        color: var(--text-muted);
+        margin-left: 0.5rem;
+    }
+    
     .stTextInput > div > div > input {
         background: var(--bg-secondary) !important;
         border: 1px solid var(--border-color) !important;
@@ -370,103 +400,210 @@ st.markdown("""
         background: var(--bg-secondary) !important;
         border-color: var(--border-color) !important;
     }
-    
-    /* Stats summary */
-    .stats-row {
-        display: grid;
-        grid-template-columns: repeat(6, 1fr);
-        gap: 1rem;
-        margin-bottom: 1.5rem;
-    }
-    
-    .stat-card {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 1rem;
-        text-align: center;
-    }
-    
-    .stat-value {
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: var(--text-primary);
-    }
-    
-    .stat-label {
-        font-size: 0.625rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-top: 0.25rem;
-    }
-    
-    /* Last update timestamp */
-    .timestamp {
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        text-align: right;
-        margin-top: 0.5rem;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ============================================================================
-# DATA FUNCTIONS
+# DATA PROVIDERS
 # ============================================================================
 
-@st.cache_data(ttl=30)  # Cache for 30 seconds for near real-time
-def get_stock_data(ticker: str) -> dict:
-    """Fetch stock data with caching"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="2d")
-        
-        current_price = info.get("regularMarketPrice") or info.get("currentPrice")
-        prev_close = info.get("regularMarketPreviousClose") or (hist['Close'].iloc[-2] if len(hist) > 1 else current_price)
-        
-        change = current_price - prev_close if current_price and prev_close else 0
-        change_pct = (change / prev_close * 100) if prev_close else 0
-        
-        return {
-            "symbol": ticker,
-            "name": info.get("shortName", ticker),
-            "price": current_price,
-            "change": change,
-            "change_pct": change_pct,
-            "volume": info.get("regularMarketVolume", 0),
-            "day_high": info.get("dayHigh"),
-            "day_low": info.get("dayLow"),
-            "iv_30": info.get("impliedVolatility"),  # May not always be available
-            "market_cap": info.get("marketCap"),
+class TradierProvider:
+    """Real-time data from Tradier API"""
+    
+    def __init__(self, api_key: str, endpoint: str = "https://sandbox.tradier.com/v1"):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json"
         }
-    except Exception as e:
-        st.error(f"Error fetching stock data: {e}")
-        return None
+    
+    def get_quote(self, symbol: str) -> Optional[Dict]:
+        """Get real-time quote for a symbol"""
+        try:
+            url = f"{self.endpoint}/markets/quotes"
+            response = requests.get(url, params={"symbols": symbol}, headers=self.headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "quotes" in data and "quote" in data["quotes"]:
+                quote = data["quotes"]["quote"]
+                return {
+                    "symbol": quote.get("symbol"),
+                    "name": quote.get("description", symbol),
+                    "price": quote.get("last"),
+                    "bid": quote.get("bid"),
+                    "ask": quote.get("ask"),
+                    "change": quote.get("change"),
+                    "change_pct": quote.get("change_percentage"),
+                    "volume": quote.get("volume"),
+                    "day_high": quote.get("high"),
+                    "day_low": quote.get("low"),
+                    "prev_close": quote.get("prevclose"),
+                }
+            return None
+        except Exception as e:
+            st.error(f"Tradier quote error: {e}")
+            return None
+    
+    def get_expirations(self, symbol: str) -> List[str]:
+        """Get available expiration dates"""
+        try:
+            url = f"{self.endpoint}/markets/options/expirations"
+            response = requests.get(url, params={"symbol": symbol}, headers=self.headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "expirations" in data and "date" in data["expirations"]:
+                dates = data["expirations"]["date"]
+                return dates if isinstance(dates, list) else [dates]
+            return []
+        except Exception as e:
+            st.error(f"Tradier expirations error: {e}")
+            return []
+    
+    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Get options chain for a given expiration"""
+        try:
+            url = f"{self.endpoint}/markets/options/chains"
+            params = {
+                "symbol": symbol,
+                "expiration": expiration,
+                "greeks": "true"
+            }
+            response = requests.get(url, params=params, headers=self.headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "options" not in data or "option" not in data["options"]:
+                return None, None
+            
+            options = data["options"]["option"]
+            if not isinstance(options, list):
+                options = [options]
+            
+            calls_data = []
+            puts_data = []
+            
+            for opt in options:
+                greeks = opt.get("greeks") or {}
+                row = {
+                    "strike": opt.get("strike"),
+                    "bid": opt.get("bid"),
+                    "ask": opt.get("ask"),
+                    "lastPrice": opt.get("last"),
+                    "volume": opt.get("volume", 0),
+                    "openInterest": opt.get("open_interest", 0),
+                    "impliedVolatility": greeks.get("mid_iv"),
+                    "delta": greeks.get("delta"),
+                    "gamma": greeks.get("gamma"),
+                    "theta": greeks.get("theta"),
+                    "vega": greeks.get("vega"),
+                }
+                
+                if opt.get("option_type") == "call":
+                    calls_data.append(row)
+                else:
+                    puts_data.append(row)
+            
+            calls_df = pd.DataFrame(calls_data) if calls_data else pd.DataFrame()
+            puts_df = pd.DataFrame(puts_data) if puts_data else pd.DataFrame()
+            
+            return calls_df, puts_df
+            
+        except Exception as e:
+            st.error(f"Tradier options chain error: {e}")
+            return None, None
 
 
-@st.cache_data(ttl=30)
-def get_options_data(ticker: str, expiration: str) -> tuple:
+class YFinanceProvider:
+    """Fallback data from Yahoo Finance (delayed ~15 min)"""
+    
+    def __init__(self):
+        import yfinance as yf
+        self.yf = yf
+    
+    def get_quote(self, symbol: str) -> Optional[Dict]:
+        """Get quote for a symbol"""
+        try:
+            stock = self.yf.Ticker(symbol)
+            info = stock.info
+            
+            current_price = info.get("regularMarketPrice") or info.get("currentPrice")
+            prev_close = info.get("regularMarketPreviousClose")
+            change = (current_price - prev_close) if current_price and prev_close else 0
+            change_pct = (change / prev_close * 100) if prev_close else 0
+            
+            return {
+                "symbol": symbol,
+                "name": info.get("shortName", symbol),
+                "price": current_price,
+                "bid": info.get("bid"),
+                "ask": info.get("ask"),
+                "change": change,
+                "change_pct": change_pct,
+                "volume": info.get("regularMarketVolume", 0),
+                "day_high": info.get("dayHigh"),
+                "day_low": info.get("dayLow"),
+                "prev_close": prev_close,
+            }
+        except Exception as e:
+            st.error(f"YFinance quote error: {e}")
+            return None
+    
+    def get_expirations(self, symbol: str) -> List[str]:
+        """Get available expiration dates"""
+        try:
+            stock = self.yf.Ticker(symbol)
+            return list(stock.options)
+        except Exception:
+            return []
+    
+    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Get options chain for a given expiration"""
+        try:
+            stock = self.yf.Ticker(symbol)
+            chain = stock.option_chain(expiration)
+            return chain.calls, chain.puts
+        except Exception as e:
+            st.error(f"YFinance options error: {e}")
+            return None, None
+
+
+# Initialize provider based on configuration
+@st.cache_resource
+def get_provider():
+    """Get the appropriate data provider"""
+    if USE_TRADIER and TRADIER_API_KEY:
+        return TradierProvider(TRADIER_API_KEY, TRADIER_ENDPOINT), "Tradier"
+    else:
+        return YFinanceProvider(), "Yahoo Finance"
+
+
+# ============================================================================
+# DATA FUNCTIONS WITH CACHING
+# ============================================================================
+
+@st.cache_data(ttl=5 if USE_TRADIER else 30)
+def get_stock_data(ticker: str) -> Optional[Dict]:
+    """Fetch stock data with appropriate caching"""
+    provider, _ = get_provider()
+    return provider.get_quote(ticker)
+
+
+@st.cache_data(ttl=5 if USE_TRADIER else 30)
+def get_options_data(ticker: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Fetch options chain data"""
-    try:
-        stock = yf.Ticker(ticker)
-        chain = stock.option_chain(expiration)
-        return chain.calls, chain.puts
-    except Exception as e:
-        st.error(f"Error fetching options: {e}")
-        return None, None
+    provider, _ = get_provider()
+    return provider.get_options_chain(ticker, expiration)
 
 
-@st.cache_data(ttl=300)  # Cache expirations for 5 minutes
-def get_expirations(ticker: str) -> list:
+@st.cache_data(ttl=300)
+def get_expirations(ticker: str) -> List[str]:
     """Get available expiration dates"""
-    try:
-        stock = yf.Ticker(ticker)
-        return list(stock.options)
-    except Exception:
-        return []
+    provider, _ = get_provider()
+    return provider.get_expirations(ticker)
 
 
 def calculate_days_to_expiry(exp_date: str) -> int:
@@ -476,22 +613,18 @@ def calculate_days_to_expiry(exp_date: str) -> int:
     return (exp - today).days
 
 
-def build_options_grid(calls: pd.DataFrame, puts: pd.DataFrame, current_price: float) -> pd.DataFrame:
+def build_options_grid(calls: pd.DataFrame, puts: pd.DataFrame, current_price: float) -> Optional[pd.DataFrame]:
     """Build unified options grid with calls and puts aligned by strike"""
-    if calls is None or puts is None:
+    if calls is None or puts is None or calls.empty or puts.empty:
         return None
     
-    # Get all unique strikes
     all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
-    
-    # Build grid data
     grid_data = []
     
     for strike in all_strikes:
         call_row = calls[calls['strike'] == strike]
         put_row = puts[puts['strike'] == strike]
         
-        # Determine moneyness
         if current_price:
             pct_diff = (strike - current_price) / current_price
             if abs(pct_diff) < 0.005:
@@ -503,23 +636,29 @@ def build_options_grid(calls: pd.DataFrame, puts: pd.DataFrame, current_price: f
         else:
             moneyness = "OTM"
         
+        def safe_get(df, col):
+            if len(df) > 0 and col in df.columns:
+                val = df[col].iloc[0]
+                return val if pd.notna(val) else None
+            return None
+        
         row = {
             "strike": strike,
             "moneyness": moneyness,
-            # Call data
-            "call_bid": call_row['bid'].iloc[0] if len(call_row) > 0 else None,
-            "call_ask": call_row['ask'].iloc[0] if len(call_row) > 0 else None,
-            "call_last": call_row['lastPrice'].iloc[0] if len(call_row) > 0 else None,
-            "call_volume": call_row['volume'].iloc[0] if len(call_row) > 0 else None,
-            "call_oi": call_row['openInterest'].iloc[0] if len(call_row) > 0 else None,
-            "call_iv": call_row['impliedVolatility'].iloc[0] if len(call_row) > 0 else None,
-            # Put data
-            "put_bid": put_row['bid'].iloc[0] if len(put_row) > 0 else None,
-            "put_ask": put_row['ask'].iloc[0] if len(put_row) > 0 else None,
-            "put_last": put_row['lastPrice'].iloc[0] if len(put_row) > 0 else None,
-            "put_volume": put_row['volume'].iloc[0] if len(put_row) > 0 else None,
-            "put_oi": put_row['openInterest'].iloc[0] if len(put_row) > 0 else None,
-            "put_iv": put_row['impliedVolatility'].iloc[0] if len(put_row) > 0 else None,
+            "call_bid": safe_get(call_row, 'bid'),
+            "call_ask": safe_get(call_row, 'ask'),
+            "call_last": safe_get(call_row, 'lastPrice'),
+            "call_volume": safe_get(call_row, 'volume'),
+            "call_oi": safe_get(call_row, 'openInterest'),
+            "call_iv": safe_get(call_row, 'impliedVolatility'),
+            "call_delta": safe_get(call_row, 'delta'),
+            "put_bid": safe_get(put_row, 'bid'),
+            "put_ask": safe_get(put_row, 'ask'),
+            "put_last": safe_get(put_row, 'lastPrice'),
+            "put_volume": safe_get(put_row, 'volume'),
+            "put_oi": safe_get(put_row, 'openInterest'),
+            "put_iv": safe_get(put_row, 'impliedVolatility'),
+            "put_delta": safe_get(put_row, 'delta'),
         }
         grid_data.append(row)
     
@@ -542,40 +681,37 @@ def format_value(val, decimals=2, prefix="", suffix=""):
     return str(val)
 
 
-def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshold: float = 0.5):
+def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshold: float = 0.5) -> str:
     """Render the options grid as HTML"""
     if grid_df is None or grid_df.empty:
-        return "<p>No options data available</p>"
+        return "<p style='color: var(--text-muted);'>No options data available</p>"
     
-    # Find max volume and OI for highlighting
     max_call_vol = grid_df['call_volume'].max() if grid_df['call_volume'].notna().any() else 1
     max_put_vol = grid_df['put_volume'].max() if grid_df['put_volume'].notna().any() else 1
     
-    html = """
+    has_delta = grid_df['call_delta'].notna().any()
+    
+    if has_delta:
+        call_headers = "<span>Δ</span><span>IV</span><span>OI</span><span>Vol</span><span>Last</span><span>Bid</span><span>Ask</span>"
+        put_headers = "<span>Bid</span><span>Ask</span><span>Last</span><span>Vol</span><span>OI</span><span>IV</span><span>Δ</span>"
+    else:
+        call_headers = "<span>IV</span><span>OI</span><span>Vol</span><span>Last</span><span>Bid</span><span>Ask</span><span></span>"
+        put_headers = "<span></span><span>Bid</span><span>Ask</span><span>Last</span><span>Vol</span><span>OI</span><span>IV</span>"
+    
+    html = f"""
     <div class="grid-container">
         <div class="grid-header">
             <div class="grid-header-calls">
-                <span>IV</span>
-                <span>OI</span>
-                <span>Vol</span>
-                <span>Last</span>
-                <span>Bid</span>
-                <span>Ask</span>
+                {call_headers}
             </div>
             <div class="grid-header-strike">STRIKE</div>
             <div class="grid-header-puts">
-                <span>Bid</span>
-                <span>Ask</span>
-                <span>Last</span>
-                <span>Vol</span>
-                <span>OI</span>
-                <span>IV</span>
+                {put_headers}
             </div>
         </div>
     """
     
     for _, row in grid_df.iterrows():
-        # Determine row class based on moneyness
         row_class = ""
         if row['moneyness'] == "ATM":
             row_class = "atm"
@@ -584,35 +720,61 @@ def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshol
         elif row['moneyness'] == "ITM_PUT":
             row_class = "itm-put"
         
-        # Format call values
         call_iv = row['call_iv']
         call_iv_class = "iv-high" if call_iv and call_iv > iv_threshold else ""
         call_vol_class = "volume-high" if row['call_volume'] and row['call_volume'] > max_call_vol * 0.5 else ""
         
-        # Format put values
         put_iv = row['put_iv']
         put_iv_class = "iv-high" if put_iv and put_iv > iv_threshold else ""
         put_vol_class = "volume-high" if row['put_volume'] and row['put_volume'] > max_put_vol * 0.5 else ""
         
-        html += f"""
-        <div class="grid-row {row_class}">
-            <div class="calls-data">
+        call_delta = format_value(row['call_delta'], 2) if has_delta else ""
+        put_delta = format_value(row['put_delta'], 2) if has_delta else ""
+        
+        if has_delta:
+            call_data = f"""
+                <span class="delta-col">{call_delta}</span>
                 <span class="{call_iv_class}">{format_value(call_iv * 100 if call_iv else None, 1)}%</span>
                 <span>{format_value(row['call_oi'], 0)}</span>
                 <span class="{call_vol_class}">{format_value(row['call_volume'], 0)}</span>
                 <span>{format_value(row['call_last'])}</span>
                 <span class="bid-ask">{format_value(row['call_bid'])}</span>
                 <span class="bid-ask">{format_value(row['call_ask'])}</span>
-            </div>
-            <div class="strike-cell">{format_value(row['strike'])}</div>
-            <div class="puts-data">
+            """
+            put_data = f"""
                 <span class="bid-ask">{format_value(row['put_bid'])}</span>
                 <span class="bid-ask">{format_value(row['put_ask'])}</span>
                 <span>{format_value(row['put_last'])}</span>
                 <span class="{put_vol_class}">{format_value(row['put_volume'], 0)}</span>
                 <span>{format_value(row['put_oi'], 0)}</span>
                 <span class="{put_iv_class}">{format_value(put_iv * 100 if put_iv else None, 1)}%</span>
-            </div>
+                <span class="delta-col">{put_delta}</span>
+            """
+        else:
+            call_data = f"""
+                <span class="{call_iv_class}">{format_value(call_iv * 100 if call_iv else None, 1)}%</span>
+                <span>{format_value(row['call_oi'], 0)}</span>
+                <span class="{call_vol_class}">{format_value(row['call_volume'], 0)}</span>
+                <span>{format_value(row['call_last'])}</span>
+                <span class="bid-ask">{format_value(row['call_bid'])}</span>
+                <span class="bid-ask">{format_value(row['call_ask'])}</span>
+                <span></span>
+            """
+            put_data = f"""
+                <span></span>
+                <span class="bid-ask">{format_value(row['put_bid'])}</span>
+                <span class="bid-ask">{format_value(row['put_ask'])}</span>
+                <span>{format_value(row['put_last'])}</span>
+                <span class="{put_vol_class}">{format_value(row['put_volume'], 0)}</span>
+                <span>{format_value(row['put_oi'], 0)}</span>
+                <span class="{put_iv_class}">{format_value(put_iv * 100 if put_iv else None, 1)}%</span>
+            """
+        
+        html += f"""
+        <div class="grid-row {row_class}">
+            <div class="calls-data">{call_data}</div>
+            <div class="strike-cell">{format_value(row['strike'])}</div>
+            <div class="puts-data">{put_data}</div>
         </div>
         """
     
@@ -624,48 +786,68 @@ def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshol
 # MAIN APP
 # ============================================================================
 
-# Header
-st.markdown("""
+provider, provider_name = get_provider()
+is_realtime = provider_name == "Tradier" and "api.tradier.com" in TRADIER_ENDPOINT
+
+if is_realtime:
+    indicator_html = '<div class="live-indicator"><div class="live-dot"></div><span>REAL-TIME</span></div>'
+elif provider_name == "Tradier":
+    indicator_html = '<div class="delayed-indicator"><div class="delayed-dot"></div><span>SANDBOX</span></div>'
+else:
+    indicator_html = '<div class="delayed-indicator"><div class="delayed-dot"></div><span>DELAYED</span></div>'
+
+st.markdown(f"""
 <div class="terminal-header">
     <div>
         <div class="terminal-title">Options Grid</div>
-        <div class="terminal-subtitle">Real-time Options Chain</div>
+        <div class="terminal-subtitle">Professional Options Chain</div>
     </div>
-    <div class="live-indicator">
-        <div class="live-dot"></div>
-        <span>LIVE</span>
-    </div>
+    {indicator_html}
 </div>
 """, unsafe_allow_html=True)
 
-# Ticker input
-col1, col2, col3 = st.columns([2, 2, 6])
-with col1:
-    ticker = st.text_input(
-        "Symbol",
-        value="SPY",
-        placeholder="Enter symbol",
-        label_visibility="collapsed",
-        key="ticker_input"
-    ).upper().strip()
+if not USE_TRADIER:
+    with st.expander("🔑 Enable Real-Time Data", expanded=False):
+        st.markdown("""
+        **Get real-time options data with Tradier:**
+        
+        1. Sign up free at [developer.tradier.com](https://developer.tradier.com/)
+        2. For Streamlit Cloud, add to `.streamlit/secrets.toml`:
+        ```toml
+        TRADIER_API_KEY = "your-api-key"
+        TRADIER_ENDPOINT = "https://api.tradier.com/v1"
+        ```
+        3. For local dev: `export TRADIER_API_KEY="your-key"`
+        """)
 
-# Auto-refresh toggle
+col1, col2, col3, col4 = st.columns([2, 1, 1, 6])
+
+with col1:
+    ticker = st.text_input("Symbol", value="SPY", label_visibility="collapsed", key="ticker").upper().strip()
+
 with col2:
-    auto_refresh = st.checkbox("Auto-refresh (30s)", value=False)
+    auto_refresh = st.checkbox("Auto-refresh", value=False)
+
+with col3:
+    if st.button("🔄"):
+        st.cache_data.clear()
 
 if auto_refresh:
-    time.sleep(0.1)  # Small delay to prevent rapid refreshes
+    time.sleep(5)
     st.rerun()
 
-# Main content
 if ticker:
-    # Fetch stock data
     stock_data = get_stock_data(ticker)
     
     if stock_data and stock_data.get("price"):
-        # Stock info bar
-        change_class = "positive" if stock_data['change'] >= 0 else "negative"
-        change_sign = "+" if stock_data['change'] >= 0 else ""
+        change = stock_data.get('change', 0) or 0
+        change_pct = stock_data.get('change_pct', 0) or 0
+        change_class = "positive" if change >= 0 else "negative"
+        change_sign = "+" if change >= 0 else ""
+        
+        day_low = stock_data.get('day_low')
+        day_high = stock_data.get('day_high')
+        range_str = f"${day_low:.2f} - ${day_high:.2f}" if day_low and day_high else "—"
         
         st.markdown(f"""
         <div class="stock-bar">
@@ -675,114 +857,79 @@ if ticker:
             </div>
             <div>
                 <div class="stock-price {change_class}">${stock_data['price']:.2f}</div>
-                <div class="stock-change {change_class}">{change_sign}{stock_data['change']:.2f} ({change_sign}{stock_data['change_pct']:.2f}%)</div>
+                <div class="stock-change {change_class}">{change_sign}{change:.2f} ({change_sign}{change_pct:.2f}%)</div>
+            </div>
+            <div class="stock-stat">
+                <div class="stock-stat-value">{format_value(stock_data.get('bid'))}/{format_value(stock_data.get('ask'))}</div>
+                <div class="stock-stat-label">Bid/Ask</div>
             </div>
             <div class="stock-stat">
                 <div class="stock-stat-value">{format_value(stock_data['volume'], 0)}</div>
                 <div class="stock-stat-label">Volume</div>
             </div>
             <div class="stock-stat">
-                <div class="stock-stat-value">${stock_data['day_low']:.2f} - ${stock_data['day_high']:.2f}</div>
+                <div class="stock-stat-value">{range_str}</div>
                 <div class="stock-stat-label">Day Range</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
         
-        # Get expirations
         expirations = get_expirations(ticker)
         
         if expirations:
-            # Expiration selector with DTE
-            exp_options = []
-            for exp in expirations[:12]:  # Show first 12 expirations
-                dte = calculate_days_to_expiry(exp)
-                exp_options.append(f"{exp} ({dte}d)")
+            exp_options = [f"{exp} ({calculate_days_to_expiry(exp)}d)" for exp in expirations[:15]]
             
             col1, col2, col3 = st.columns([3, 2, 5])
             
             with col1:
-                selected_exp_display = st.selectbox(
-                    "Expiration",
-                    options=exp_options,
-                    label_visibility="collapsed"
-                )
+                selected_exp_display = st.selectbox("Expiration", options=exp_options, label_visibility="collapsed")
                 selected_exp = selected_exp_display.split(" (")[0]
             
             with col2:
-                strike_range = st.slider(
-                    "Strike Range (%)",
-                    min_value=5,
-                    max_value=50,
-                    value=15,
-                    step=5,
-                    label_visibility="collapsed",
-                    help="Show strikes within X% of current price"
-                )
+                strike_range = st.slider("Range %", 5, 50, 15, 5, label_visibility="collapsed", help="Strike range from ATM")
             
-            # Fetch options data
             calls, puts = get_options_data(ticker, selected_exp)
             
-            if calls is not None and puts is not None:
-                # Build and filter grid
+            if calls is not None and puts is not None and not calls.empty and not puts.empty:
                 grid_df = build_options_grid(calls, puts, stock_data['price'])
                 
-                if grid_df is not None:
-                    # Filter by strike range
+                if grid_df is not None and not grid_df.empty:
                     current_price = stock_data['price']
                     min_strike = current_price * (1 - strike_range / 100)
                     max_strike = current_price * (1 + strike_range / 100)
                     grid_df = grid_df[(grid_df['strike'] >= min_strike) & (grid_df['strike'] <= max_strike)]
                     
-                    # Summary stats
-                    total_call_oi = grid_df['call_oi'].sum()
-                    total_put_oi = grid_df['put_oi'].sum()
-                    total_call_vol = grid_df['call_volume'].sum()
-                    total_put_vol = grid_df['put_volume'].sum()
+                    total_call_oi = grid_df['call_oi'].sum() or 0
+                    total_put_oi = grid_df['put_oi'].sum() or 0
+                    total_call_vol = grid_df['call_volume'].sum() or 0
+                    total_put_vol = grid_df['put_volume'].sum() or 0
                     put_call_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-                    avg_iv = grid_df[['call_iv', 'put_iv']].mean().mean() * 100
+                    
+                    iv_vals = [v for v in grid_df[['call_iv', 'put_iv']].values.flatten() if pd.notna(v)]
+                    avg_iv = (sum(iv_vals) / len(iv_vals) * 100) if iv_vals else 0
                     
                     st.markdown(f"""
                     <div class="stats-row">
-                        <div class="stat-card">
-                            <div class="stat-value">{format_value(total_call_oi, 0)}</div>
-                            <div class="stat-label">Call OI</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{format_value(total_put_oi, 0)}</div>
-                            <div class="stat-label">Put OI</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{put_call_ratio:.2f}</div>
-                            <div class="stat-label">P/C Ratio</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{format_value(total_call_vol, 0)}</div>
-                            <div class="stat-label">Call Vol</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{format_value(total_put_vol, 0)}</div>
-                            <div class="stat-label">Put Vol</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{avg_iv:.1f}%</div>
-                            <div class="stat-label">Avg IV</div>
-                        </div>
+                        <div class="stat-card"><div class="stat-value">{format_value(total_call_oi, 0)}</div><div class="stat-label">Call OI</div></div>
+                        <div class="stat-card"><div class="stat-value">{format_value(total_put_oi, 0)}</div><div class="stat-label">Put OI</div></div>
+                        <div class="stat-card"><div class="stat-value">{put_call_ratio:.2f}</div><div class="stat-label">P/C Ratio</div></div>
+                        <div class="stat-card"><div class="stat-value">{format_value(total_call_vol, 0)}</div><div class="stat-label">Call Vol</div></div>
+                        <div class="stat-card"><div class="stat-value">{format_value(total_put_vol, 0)}</div><div class="stat-label">Put Vol</div></div>
+                        <div class="stat-card"><div class="stat-value">{avg_iv:.1f}%</div><div class="stat-label">Avg IV</div></div>
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Render options grid
-                    grid_html = render_options_grid(grid_df, current_price)
-                    st.markdown(grid_html, unsafe_allow_html=True)
+                    st.markdown(render_options_grid(grid_df, current_price), unsafe_allow_html=True)
                     
-                    # Timestamp
                     st.markdown(f"""
                     <div class="timestamp">
-                        Last updated: {datetime.now().strftime("%H:%M:%S")} • {len(grid_df)} strikes shown
+                        {datetime.now().strftime("%H:%M:%S")} • {len(grid_df)} strikes
+                        <span class="data-source">{provider_name}</span>
                     </div>
                     """, unsafe_allow_html=True)
             else:
-                st.warning("Could not load options data for this expiration.")
+                st.warning("Could not load options chain.")
         else:
-            st.warning(f"No options available for {ticker}")
+            st.warning(f"No options for {ticker}")
     else:
-        st.error(f"Could not find data for: {ticker}")
+        st.error(f"Could not find: {ticker}")
