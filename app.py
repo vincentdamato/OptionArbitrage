@@ -897,7 +897,7 @@ if ticker:
                 selected_exp = selected_exp_display.split(" (")[0]
             
             with col2:
-                strike_range = st.slider("Range %", 5, 50, 15, 5, label_visibility="collapsed", help="Strike range from ATM")
+                strike_range = st.slider("Range %", 5, 50, 8, 5, label_visibility="collapsed", help="Strike range from ATM")
             
             calls, puts = get_options_data(ticker, selected_exp)
             
@@ -910,13 +910,26 @@ if ticker:
                     max_strike = current_price * (1 + strike_range / 100)
                     grid_df = grid_df[(grid_df['strike'] >= min_strike) & (grid_df['strike'] <= max_strike)]
                     
+                    # Filter out rows where BOTH sides are completely empty
+                    def has_market(row):
+                        call_has_market = (pd.notna(row['call_bid']) and row['call_bid'] > 0) or \
+                                         (pd.notna(row['call_ask']) and row['call_ask'] > 0)
+                        put_has_market = (pd.notna(row['put_bid']) and row['put_bid'] > 0) or \
+                                        (pd.notna(row['put_ask']) and row['put_ask'] > 0)
+                        return call_has_market or put_has_market
+                    
+                    grid_df = grid_df[grid_df.apply(has_market, axis=1)]
+                    
                     total_call_oi = grid_df['call_oi'].sum() or 0
                     total_put_oi = grid_df['put_oi'].sum() or 0
                     total_call_vol = grid_df['call_volume'].sum() or 0
                     total_put_vol = grid_df['put_volume'].sum() or 0
                     put_call_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
                     
-                    iv_vals = [v for v in grid_df[['call_iv', 'put_iv']].values.flatten() if pd.notna(v)]
+                    # Calculate dynamic IV threshold (1.5x median IV of the chain)
+                    iv_vals = [v for v in grid_df[['call_iv', 'put_iv']].values.flatten() if pd.notna(v) and v > 0]
+                    median_iv = np.median(iv_vals) if iv_vals else 0.3
+                    iv_threshold = median_iv * 1.5  # Highlight IVs 50% above median
                     avg_iv = (sum(iv_vals) / len(iv_vals) * 100) if iv_vals else 0
                     
                     st.markdown(f"""
@@ -926,11 +939,11 @@ if ticker:
                         <div class="stat-card"><div class="stat-value">{put_call_ratio:.2f}</div><div class="stat-label">P/C Ratio</div></div>
                         <div class="stat-card"><div class="stat-value">{format_value(total_call_vol, 0)}</div><div class="stat-label">Call Vol</div></div>
                         <div class="stat-card"><div class="stat-value">{format_value(total_put_vol, 0)}</div><div class="stat-label">Put Vol</div></div>
-                        <div class="stat-card"><div class="stat-value">{avg_iv:.1f}%</div><div class="stat-label">Avg IV</div></div>
+                        <div class="stat-card"><div class="stat-value">{avg_iv:.1f}%</div><div class="stat-label">Avg IV (>{iv_threshold*100:.0f}% ⚠)</div></div>
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    st.markdown(render_options_grid(grid_df, current_price), unsafe_allow_html=True)
+                    st.markdown(render_options_grid(grid_df, current_price, iv_threshold), unsafe_allow_html=True)
                     
                     st.markdown(f"""
                     <div class="timestamp">
