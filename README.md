@@ -10,6 +10,7 @@ A clean, minimal options chain viewer built with Streamlit.
 - Clean, professional interface
 
 ## Quick Start
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
@@ -22,21 +23,3 @@ Market data provided by Yahoo Finance via yfinance.
 ---
 
 *For educational purposes only. Not financial advice.*
-```
-
----
-
-**4. .gitignore**
-```
-__pycache__/
-*.py[cod]
-venv/
-.venv/
-.env
-.vscode/
-.idea/
-.DS_Store
-*.csv
-*.parquet
-*.db
-.streamlit/secrets.toml
