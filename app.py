@@ -268,8 +268,14 @@ st.markdown("""
     
     .grid-row.atm {
         background: var(--atm-bg);
-        border-top: 1px solid var(--accent-blue);
-        border-bottom: 1px solid var(--accent-blue);
+        border-top: 2px solid var(--accent-blue);
+        border-bottom: 2px solid var(--accent-blue);
+        font-weight: 600;
+    }
+    
+    .grid-row.atm .strike-cell {
+        background: var(--accent-blue);
+        color: white;
     }
     
     .calls-data, .puts-data {
@@ -621,13 +627,18 @@ def build_options_grid(calls: pd.DataFrame, puts: pd.DataFrame, current_price: f
     all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
     grid_data = []
     
+    # Find the closest strike to current price for ATM marking
+    if current_price:
+        atm_strike = min(all_strikes, key=lambda x: abs(x - current_price))
+    else:
+        atm_strike = None
+    
     for strike in all_strikes:
         call_row = calls[calls['strike'] == strike]
         put_row = puts[puts['strike'] == strike]
         
         if current_price:
-            pct_diff = (strike - current_price) / current_price
-            if abs(pct_diff) < 0.005:
+            if strike == atm_strike:
                 moneyness = "ATM"
             elif strike < current_price:
                 moneyness = "ITM_CALL"
@@ -681,7 +692,7 @@ def format_value(val, decimals=2, prefix="", suffix=""):
     return str(val)
 
 
-def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshold: float = 0.5) -> str:
+def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshold: float = 0.8) -> str:
     """Render the options grid as HTML"""
     if grid_df is None or grid_df.empty:
         return "<p style='color: var(--text-muted);'>No options data available</p>"
