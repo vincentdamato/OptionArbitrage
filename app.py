@@ -1,6 +1,6 @@
 """
 Options Screener - Professional Options Grid
-Real-time options chain with Tradier API + yfinance fallback
+Real-time options chain with Schwab/Tradier API + yfinance fallback
 """
 
 import streamlit as st
@@ -11,6 +11,13 @@ import time
 import requests
 from typing import Optional, Tuple, Dict, List
 import os
+
+# Load environment variables from .env file (if exists)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use system env vars
 
 # Page configuration
 st.set_page_config(
@@ -24,7 +31,21 @@ st.set_page_config(
 # CONFIGURATION
 # ============================================================================
 
-# Tradier API Configuration
+# Data Provider Priority: Schwab > Tradier > Yahoo Finance
+# 
+# SCHWAB API (Recommended - Free with Schwab account)
+# Setup: https://developer.schwab.com/
+# 1. Create developer account
+# 2. Register app with "Market Data Production"
+# 3. Set callback URL to: https://127.0.0.1:8182
+# 4. Wait 2-3 days for approval
+# 5. Run initial auth to get tokens (see setup instructions below)
+
+SCHWAB_APP_KEY = os.environ.get("SCHWAB_APP_KEY", "")
+SCHWAB_APP_SECRET = os.environ.get("SCHWAB_APP_SECRET", "")
+SCHWAB_TOKEN_PATH = os.environ.get("SCHWAB_TOKEN_PATH", "schwab_tokens.json")
+
+# Tradier API Configuration (Alternative)
 # Get your free API key at: https://developer.tradier.com/
 # For sandbox (delayed): use 'sandbox.tradier.com' 
 # For live (real-time): use 'api.tradier.com'
@@ -32,8 +53,9 @@ st.set_page_config(
 TRADIER_API_KEY = os.environ.get("TRADIER_API_KEY", "")
 TRADIER_ENDPOINT = os.environ.get("TRADIER_ENDPOINT", "https://sandbox.tradier.com/v1")
 
-# Set to True to use Tradier when API key is available
-USE_TRADIER = bool(TRADIER_API_KEY)
+# Provider selection (auto-detect based on credentials)
+USE_SCHWAB = bool(SCHWAB_APP_KEY and SCHWAB_APP_SECRET)
+USE_TRADIER = bool(TRADIER_API_KEY) and not USE_SCHWAB
 
 # ============================================================================
 # STYLING
@@ -414,6 +436,239 @@ st.markdown("""
 # DATA PROVIDERS
 # ============================================================================
 
+class SchwabProvider:
+    """Real-time data from Charles Schwab API"""
+    
+    def __init__(self, app_key: str, app_secret: str, token_path: str = "schwab_tokens.json"):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.token_path = token_path
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
+        self.base_url = "https://api.schwabapi.com/marketdata/v1"
+        self._load_tokens()
+    
+    def _load_tokens(self):
+        """Load tokens from file"""
+        import json
+        try:
+            if os.path.exists(self.token_path):
+                with open(self.token_path, 'r') as f:
+                    tokens = json.load(f)
+                    self.access_token = tokens.get('access_token')
+                    self.refresh_token = tokens.get('refresh_token')
+                    expiry = tokens.get('token_expiry')
+                    if expiry:
+                        self.token_expiry = datetime.fromisoformat(expiry)
+        except Exception as e:
+            st.warning(f"Could not load Schwab tokens: {e}")
+    
+    def _save_tokens(self):
+        """Save tokens to file"""
+        import json
+        try:
+            tokens = {
+                'access_token': self.access_token,
+                'refresh_token': self.refresh_token,
+                'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None
+            }
+            with open(self.token_path, 'w') as f:
+                json.dump(tokens, f)
+        except Exception as e:
+            st.warning(f"Could not save Schwab tokens: {e}")
+    
+    def _refresh_access_token(self) -> bool:
+        """Refresh the access token using refresh token"""
+        if not self.refresh_token:
+            return False
+        
+        try:
+            import base64
+            auth_string = f"{self.app_key}:{self.app_secret}"
+            auth_bytes = base64.b64encode(auth_string.encode()).decode()
+            
+            response = requests.post(
+                "https://api.schwabapi.com/v1/oauth/token",
+                headers={
+                    "Authorization": f"Basic {auth_bytes}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.refresh_token
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                self.access_token = data['access_token']
+                self.refresh_token = data.get('refresh_token', self.refresh_token)
+                self.token_expiry = datetime.now() + timedelta(seconds=data.get('expires_in', 1800))
+                self._save_tokens()
+                return True
+            else:
+                st.error(f"Token refresh failed: {response.status_code}")
+                return False
+        except Exception as e:
+            st.error(f"Token refresh error: {e}")
+            return False
+    
+    def _ensure_valid_token(self) -> bool:
+        """Ensure we have a valid access token"""
+        if not self.access_token:
+            return False
+        
+        # Refresh if token expires in less than 5 minutes
+        if self.token_expiry and datetime.now() > self.token_expiry - timedelta(minutes=5):
+            return self._refresh_access_token()
+        
+        return True
+    
+    def _get_headers(self) -> Dict:
+        """Get headers with current access token"""
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "application/json"
+        }
+    
+    def is_authenticated(self) -> bool:
+        """Check if we have valid authentication"""
+        return self._ensure_valid_token()
+    
+    def get_quote(self, symbol: str) -> Optional[Dict]:
+        """Get real-time quote for a symbol"""
+        if not self._ensure_valid_token():
+            return None
+        
+        try:
+            url = f"{self.base_url}/quotes"
+            response = requests.get(
+                url, 
+                params={"symbols": symbol, "fields": "quote,reference"},
+                headers=self._get_headers()
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if symbol in data:
+                quote = data[symbol].get("quote", {})
+                ref = data[symbol].get("reference", {})
+                
+                return {
+                    "symbol": symbol,
+                    "name": ref.get("description", symbol),
+                    "price": quote.get("lastPrice"),
+                    "bid": quote.get("bidPrice"),
+                    "ask": quote.get("askPrice"),
+                    "change": quote.get("netChange"),
+                    "change_pct": quote.get("netPercentChangeInDouble"),
+                    "volume": quote.get("totalVolume"),
+                    "day_high": quote.get("highPrice"),
+                    "day_low": quote.get("lowPrice"),
+                    "prev_close": quote.get("closePrice"),
+                }
+            return None
+        except Exception as e:
+            st.error(f"Schwab quote error: {e}")
+            return None
+    
+    def get_expirations(self, symbol: str) -> List[str]:
+        """Get available expiration dates"""
+        if not self._ensure_valid_token():
+            return []
+        
+        try:
+            url = f"{self.base_url}/expirationchain"
+            response = requests.get(
+                url,
+                params={"symbol": symbol},
+                headers=self._get_headers()
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            expirations = []
+            for exp in data.get("expirationList", []):
+                exp_date = exp.get("expirationDate")
+                if exp_date:
+                    expirations.append(exp_date)
+            
+            return sorted(expirations)
+        except Exception as e:
+            st.error(f"Schwab expirations error: {e}")
+            return []
+    
+    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Get options chain for a given expiration"""
+        if not self._ensure_valid_token():
+            return None, None
+        
+        try:
+            url = f"{self.base_url}/chains"
+            params = {
+                "symbol": symbol,
+                "contractType": "ALL",
+                "strikeCount": 100,
+                "includeUnderlyingQuote": "true",
+                "fromDate": expiration,
+                "toDate": expiration
+            }
+            response = requests.get(url, params=params, headers=self._get_headers())
+            response.raise_for_status()
+            data = response.json()
+            
+            calls_data = []
+            puts_data = []
+            
+            # Process call options
+            call_map = data.get("callExpDateMap", {})
+            for exp_key, strikes in call_map.items():
+                for strike_key, options in strikes.items():
+                    for opt in options:
+                        calls_data.append({
+                            "strike": opt.get("strikePrice"),
+                            "bid": opt.get("bid"),
+                            "ask": opt.get("ask"),
+                            "lastPrice": opt.get("last"),
+                            "volume": opt.get("totalVolume", 0),
+                            "openInterest": opt.get("openInterest", 0),
+                            "impliedVolatility": opt.get("volatility"),
+                            "delta": opt.get("delta"),
+                            "gamma": opt.get("gamma"),
+                            "theta": opt.get("theta"),
+                            "vega": opt.get("vega"),
+                        })
+            
+            # Process put options
+            put_map = data.get("putExpDateMap", {})
+            for exp_key, strikes in put_map.items():
+                for strike_key, options in strikes.items():
+                    for opt in options:
+                        puts_data.append({
+                            "strike": opt.get("strikePrice"),
+                            "bid": opt.get("bid"),
+                            "ask": opt.get("ask"),
+                            "lastPrice": opt.get("last"),
+                            "volume": opt.get("totalVolume", 0),
+                            "openInterest": opt.get("openInterest", 0),
+                            "impliedVolatility": opt.get("volatility"),
+                            "delta": opt.get("delta"),
+                            "gamma": opt.get("gamma"),
+                            "theta": opt.get("theta"),
+                            "vega": opt.get("vega"),
+                        })
+            
+            calls_df = pd.DataFrame(calls_data) if calls_data else pd.DataFrame()
+            puts_df = pd.DataFrame(puts_data) if puts_data else pd.DataFrame()
+            
+            return calls_df, puts_df
+            
+        except Exception as e:
+            st.error(f"Schwab options chain error: {e}")
+            return None, None
+
+
 class TradierProvider:
     """Real-time data from Tradier API"""
     
@@ -580,25 +835,35 @@ class YFinanceProvider:
 # Initialize provider based on configuration
 @st.cache_resource
 def get_provider():
-    """Get the appropriate data provider"""
+    """Get the appropriate data provider (Schwab > Tradier > Yahoo)"""
+    if USE_SCHWAB and SCHWAB_APP_KEY and SCHWAB_APP_SECRET:
+        provider = SchwabProvider(SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_PATH)
+        if provider.is_authenticated():
+            return provider, "Schwab"
+        else:
+            st.warning("Schwab tokens not found or expired. Run initial auth setup.")
+    
     if USE_TRADIER and TRADIER_API_KEY:
         return TradierProvider(TRADIER_API_KEY, TRADIER_ENDPOINT), "Tradier"
-    else:
-        return YFinanceProvider(), "Yahoo Finance"
+    
+    return YFinanceProvider(), "Yahoo Finance"
 
 
 # ============================================================================
 # DATA FUNCTIONS WITH CACHING
 # ============================================================================
 
-@st.cache_data(ttl=5 if USE_TRADIER else 30)
+# Determine cache TTL based on provider
+CACHE_TTL = 5 if (USE_SCHWAB or USE_TRADIER) else 30
+
+@st.cache_data(ttl=CACHE_TTL)
 def get_stock_data(ticker: str) -> Optional[Dict]:
     """Fetch stock data with appropriate caching"""
     provider, _ = get_provider()
     return provider.get_quote(ticker)
 
 
-@st.cache_data(ttl=5 if USE_TRADIER else 30)
+@st.cache_data(ttl=CACHE_TTL)
 def get_options_data(ticker: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Fetch options chain data"""
     provider, _ = get_provider()
@@ -798,9 +1063,12 @@ def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshol
 # ============================================================================
 
 provider, provider_name = get_provider()
-is_realtime = provider_name == "Tradier" and "api.tradier.com" in TRADIER_ENDPOINT
+is_realtime = (provider_name == "Schwab" or 
+               (provider_name == "Tradier" and "api.tradier.com" in TRADIER_ENDPOINT))
 
-if is_realtime:
+if provider_name == "Schwab":
+    indicator_html = '<div class="live-indicator"><div class="live-dot"></div><span>SCHWAB LIVE</span></div>'
+elif is_realtime:
     indicator_html = '<div class="live-indicator"><div class="live-dot"></div><span>REAL-TIME</span></div>'
 elif provider_name == "Tradier":
     indicator_html = '<div class="delayed-indicator"><div class="delayed-dot"></div><span>SANDBOX</span></div>'
@@ -817,10 +1085,33 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-if not USE_TRADIER:
+if not USE_SCHWAB and not USE_TRADIER:
     with st.expander("🔑 Enable Real-Time Data", expanded=False):
         st.markdown("""
-        **Get real-time options data with Tradier:**
+        ### Option 1: Charles Schwab (Recommended - Free with account)
+        
+        1. Create developer account at [developer.schwab.com](https://developer.schwab.com/)
+        2. Register an app with "Market Data Production"
+        3. Set callback URL: `https://127.0.0.1:8182`
+        4. Wait 2-3 days for approval
+        5. Run initial auth (first time only):
+        ```bash
+        pip install schwab-py
+        python -c "
+        import schwab
+        schwab.auth.easy_client('YOUR_APP_KEY', 'YOUR_APP_SECRET', 
+                                'https://127.0.0.1:8182', 'schwab_tokens.json')
+        "
+        ```
+        6. Set environment variables:
+        ```bash
+        export SCHWAB_APP_KEY="your-app-key"
+        export SCHWAB_APP_SECRET="your-app-secret"
+        ```
+        
+        ---
+        
+        ### Option 2: Tradier (Simpler setup)
         
         1. Sign up free at [developer.tradier.com](https://developer.tradier.com/)
         2. For Streamlit Cloud, add to `.streamlit/secrets.toml`:
@@ -910,15 +1201,18 @@ if ticker:
                     max_strike = current_price * (1 + strike_range / 100)
                     grid_df = grid_df[(grid_df['strike'] >= min_strike) & (grid_df['strike'] <= max_strike)]
                     
-                    # Filter out rows where BOTH sides are completely empty
-                    def has_market(row):
-                        call_has_market = (pd.notna(row['call_bid']) and row['call_bid'] > 0) or \
-                                         (pd.notna(row['call_ask']) and row['call_ask'] > 0)
-                        put_has_market = (pd.notna(row['put_bid']) and row['put_bid'] > 0) or \
-                                        (pd.notna(row['put_ask']) and row['put_ask'] > 0)
-                        return call_has_market or put_has_market
+                    # Show applied range
+                    st.caption(f"📊 Showing strikes ${min_strike:.0f} - ${max_strike:.0f} ({len(grid_df)} strikes)")
                     
-                    grid_df = grid_df[grid_df.apply(has_market, axis=1)]
+                    # Filter: require a real two-sided market (bid > 0 AND ask > 0) on at least one side
+                    def has_real_market(row):
+                        call_liquid = (pd.notna(row['call_bid']) and row['call_bid'] > 0.01 and 
+                                      pd.notna(row['call_ask']) and row['call_ask'] > 0)
+                        put_liquid = (pd.notna(row['put_bid']) and row['put_bid'] > 0.01 and 
+                                     pd.notna(row['put_ask']) and row['put_ask'] > 0)
+                        return call_liquid or put_liquid
+                    
+                    grid_df = grid_df[grid_df.apply(has_real_market, axis=1)]
                     
                     total_call_oi = grid_df['call_oi'].sum() or 0
                     total_put_oi = grid_df['put_oi'].sum() or 0
