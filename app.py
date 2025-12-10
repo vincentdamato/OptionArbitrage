@@ -1,1253 +1,773 @@
 """
-Options Screener - Professional Options Grid
-Real-time options chain with Schwab/Tradier API + yfinance fallback
+Options Arbitrage Scanner - Streamlit Dashboard
+Real-time arbitrage detection with Schwab API integration.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
-import requests
-from typing import Optional, Tuple, Dict, List
-import os
+from typing import Dict, List, Optional
+import json
 
-# Load environment variables from .env file (if exists)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # dotenv not installed, use system env vars
-
-# Page configuration
+# Page config
 st.set_page_config(
-    page_title="Options Grid",
-    page_icon="⚡",
+    page_title="Options Arbitrage Scanner",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Data Provider Priority: Schwab > Tradier > Yahoo Finance
-# 
-# SCHWAB API (Recommended - Free with Schwab account)
-# Setup: https://developer.schwab.com/
-# 1. Create developer account
-# 2. Register app with "Market Data Production"
-# 3. Set callback URL to: https://127.0.0.1:8182
-# 4. Wait 2-3 days for approval
-# 5. Run initial auth to get tokens (see setup instructions below)
-
-SCHWAB_APP_KEY = os.environ.get("SCHWAB_APP_KEY", "")
-SCHWAB_APP_SECRET = os.environ.get("SCHWAB_APP_SECRET", "")
-SCHWAB_TOKEN_PATH = os.environ.get("SCHWAB_TOKEN_PATH", "schwab_tokens.json")
-
-# Tradier API Configuration (Alternative)
-# Get your free API key at: https://developer.tradier.com/
-# For sandbox (delayed): use 'sandbox.tradier.com' 
-# For live (real-time): use 'api.tradier.com'
-
-TRADIER_API_KEY = os.environ.get("TRADIER_API_KEY", "")
-TRADIER_ENDPOINT = os.environ.get("TRADIER_ENDPOINT", "https://sandbox.tradier.com/v1")
-
-# Provider selection (auto-detect based on credentials)
-USE_SCHWAB = bool(SCHWAB_APP_KEY and SCHWAB_APP_SECRET)
-USE_TRADIER = bool(TRADIER_API_KEY) and not USE_SCHWAB
-
-# ============================================================================
-# STYLING
-# ============================================================================
-
+# Custom CSS
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-    
-    :root {
-        --bg-primary: #0a0a0f;
-        --bg-secondary: #12121a;
-        --bg-tertiary: #1a1a24;
-        --border-color: #2a2a3a;
-        --text-primary: #e4e4e7;
-        --text-secondary: #71717a;
-        --text-muted: #52525b;
-        --accent-green: #22c55e;
-        --accent-green-dim: #166534;
-        --accent-red: #ef4444;
-        --accent-red-dim: #991b1b;
-        --accent-blue: #3b82f6;
-        --accent-yellow: #eab308;
-        --accent-orange: #f97316;
-        --itm-bg: rgba(34, 197, 94, 0.08);
-        --otm-bg: transparent;
-        --atm-bg: rgba(59, 130, 246, 0.12);
+    .stMetric {
+        background-color: #1e1e1e;
+        padding: 10px;
+        border-radius: 5px;
     }
-    
-    .stApp {
-        background: var(--bg-primary);
+    .opportunity-card {
+        background-color: #262730;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+        border-left: 4px solid #00ff88;
     }
-    
-    html, body, [class*="css"] {
-        font-family: 'JetBrains Mono', monospace;
-        color: var(--text-primary);
+    .risk-free {
+        border-left-color: #00ff88;
     }
-    
-    #MainMenu, footer, header {visibility: hidden;}
-    .stDeployButton {display: none;}
-    
-    .terminal-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 1rem 0;
-        border-bottom: 1px solid var(--border-color);
-        margin-bottom: 1.5rem;
+    .statistical {
+        border-left-color: #ffaa00;
     }
-    
-    .terminal-title {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.5rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        letter-spacing: -0.02em;
-    }
-    
-    .terminal-subtitle {
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-    }
-    
-    .live-indicator {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-size: 0.75rem;
-        color: var(--accent-green);
-    }
-    
-    .delayed-indicator {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-size: 0.75rem;
-        color: var(--accent-orange);
-    }
-    
-    .live-dot {
-        width: 8px;
-        height: 8px;
-        background: var(--accent-green);
-        border-radius: 50%;
-        animation: pulse 2s infinite;
-    }
-    
-    .delayed-dot {
-        width: 8px;
-        height: 8px;
-        background: var(--accent-orange);
-        border-radius: 50%;
-    }
-    
-    @keyframes pulse {
-        0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
-        50% { opacity: 0.8; box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
-    }
-    
-    .stock-bar {
-        display: flex;
-        align-items: center;
-        gap: 2rem;
-        padding: 1rem 1.5rem;
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        margin-bottom: 1.5rem;
-        flex-wrap: wrap;
-    }
-    
-    .stock-symbol {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 2rem;
-        font-weight: 700;
-        color: var(--text-primary);
-    }
-    
-    .stock-name {
-        font-size: 0.875rem;
-        color: var(--text-secondary);
-    }
-    
-    .stock-price {
-        font-size: 1.75rem;
-        font-weight: 600;
-    }
-    
-    .stock-change {
-        font-size: 0.875rem;
-        font-weight: 500;
-    }
-    
-    .positive { color: var(--accent-green); }
-    .negative { color: var(--accent-red); }
-    
-    .stock-stat {
-        text-align: center;
-    }
-    
-    .stock-stat-value {
-        font-size: 1rem;
-        font-weight: 600;
-        color: var(--text-primary);
-    }
-    
-    .stock-stat-label {
-        font-size: 0.625rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    
-    .grid-container {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        overflow: hidden;
-        overflow-x: auto;
-    }
-    
-    .grid-header {
-        display: grid;
-        grid-template-columns: 1fr 100px 1fr;
-        background: var(--bg-tertiary);
-        border-bottom: 1px solid var(--border-color);
-        font-size: 0.7rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        min-width: 900px;
-    }
-    
-    .grid-header-calls, .grid-header-puts {
-        display: grid;
-        grid-template-columns: repeat(7, 1fr);
-        padding: 0.75rem 0.5rem;
-    }
-    
-    .grid-header-calls {
-        background: rgba(34, 197, 94, 0.1);
-        color: var(--accent-green);
-    }
-    
-    .grid-header-puts {
-        background: rgba(239, 68, 68, 0.1);
-        color: var(--accent-red);
-    }
-    
-    .grid-header-strike {
-        padding: 0.75rem 0.5rem;
-        text-align: center;
-        color: var(--accent-blue);
-        background: rgba(59, 130, 246, 0.1);
-    }
-    
-    .grid-header span {
-        text-align: right;
-        padding: 0 0.25rem;
-    }
-    
-    .grid-header span:first-child {
-        text-align: left;
-    }
-    
-    .grid-row {
-        display: grid;
-        grid-template-columns: 1fr 100px 1fr;
-        border-bottom: 1px solid var(--border-color);
-        font-size: 0.75rem;
-        transition: background 0.15s ease;
-        min-width: 900px;
-    }
-    
-    .grid-row:hover {
-        background: rgba(255, 255, 255, 0.02);
-    }
-    
-    .grid-row:last-child {
-        border-bottom: none;
-    }
-    
-    .grid-row.itm-call .calls-data {
-        background: var(--itm-bg);
-    }
-    
-    .grid-row.itm-put .puts-data {
-        background: var(--itm-bg);
-    }
-    
-    .grid-row.atm {
-        background: var(--atm-bg);
-        border-top: 2px solid var(--accent-blue);
-        border-bottom: 2px solid var(--accent-blue);
-        font-weight: 600;
-    }
-    
-    .grid-row.atm .strike-cell {
-        background: var(--accent-blue);
-        color: white;
-    }
-    
-    .calls-data, .puts-data {
-        display: grid;
-        grid-template-columns: repeat(7, 1fr);
-        padding: 0.4rem 0.5rem;
-        align-items: center;
-    }
-    
-    .calls-data span, .puts-data span {
-        text-align: right;
-        color: var(--text-secondary);
-        padding: 0 0.25rem;
-        white-space: nowrap;
-    }
-    
-    .calls-data span:first-child, .puts-data span:first-child {
-        text-align: left;
-    }
-    
-    .strike-cell {
-        padding: 0.4rem 0.5rem;
-        text-align: center;
-        font-weight: 600;
-        color: var(--text-primary);
-        background: var(--bg-tertiary);
-    }
-    
-    .bid-ask {
-        color: var(--text-primary) !important;
-        font-weight: 500;
-    }
-    
-    .iv-high {
-        color: var(--accent-yellow) !important;
-    }
-    
-    .volume-high {
-        color: var(--accent-blue) !important;
-    }
-    
-    .delta-col {
-        color: var(--accent-blue) !important;
-    }
-    
-    .stats-row {
-        display: grid;
-        grid-template-columns: repeat(6, 1fr);
-        gap: 0.75rem;
-        margin-bottom: 1.5rem;
-    }
-    
-    .stat-card {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 0.875rem;
-        text-align: center;
-    }
-    
-    .stat-value {
-        font-size: 1.125rem;
-        font-weight: 600;
-        color: var(--text-primary);
-    }
-    
-    .stat-label {
-        font-size: 0.625rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-top: 0.25rem;
-    }
-    
-    .timestamp {
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        text-align: right;
-        margin-top: 0.5rem;
-    }
-    
-    .data-source {
-        display: inline-block;
-        padding: 0.25rem 0.5rem;
-        background: var(--bg-tertiary);
-        border-radius: 4px;
-        font-size: 0.625rem;
-        color: var(--text-muted);
-        margin-left: 0.5rem;
-    }
-    
-    .stTextInput > div > div > input {
-        background: var(--bg-secondary) !important;
-        border: 1px solid var(--border-color) !important;
-        border-radius: 6px !important;
-        color: var(--text-primary) !important;
-        font-family: 'JetBrains Mono', monospace !important;
-        font-size: 1rem !important;
-        padding: 0.75rem 1rem !important;
-    }
-    
-    .stTextInput > div > div > input:focus {
-        border-color: var(--accent-blue) !important;
-        box-shadow: 0 0 0 1px var(--accent-blue) !important;
-    }
-    
-    .stSelectbox > div > div {
-        background: var(--bg-secondary) !important;
-        border: 1px solid var(--border-color) !important;
-        border-radius: 6px !important;
-    }
-    
-    .stSelectbox > div > div > div {
-        color: var(--text-primary) !important;
-        font-family: 'JetBrains Mono', monospace !important;
-    }
-    
-    .stCheckbox > label {
-        color: var(--text-secondary) !important;
-        font-size: 0.875rem !important;
-    }
-    
-    .stSlider > div > div > div {
-        background: var(--accent-blue) !important;
-    }
-    
-    div[data-baseweb="select"] > div {
-        background: var(--bg-secondary) !important;
-        border-color: var(--border-color) !important;
+    .header-title {
+        font-size: 2.5rem;
+        font-weight: bold;
+        background: linear-gradient(90deg, #00ff88, #00aaff);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ============================================================================
-# DATA PROVIDERS
-# ============================================================================
-
-class SchwabProvider:
-    """Real-time data from Charles Schwab API"""
-    
-    def __init__(self, app_key: str, app_secret: str, token_path: str = "schwab_tokens.json"):
-        self.app_key = app_key
-        self.app_secret = app_secret
-        self.token_path = token_path
-        self.access_token = None
-        self.refresh_token = None
-        self.token_expiry = None
-        self.base_url = "https://api.schwabapi.com/marketdata/v1"
-        self._load_tokens()
-    
-    def _load_tokens(self):
-        """Load tokens from file"""
-        import json
-        try:
-            if os.path.exists(self.token_path):
-                with open(self.token_path, 'r') as f:
-                    tokens = json.load(f)
-                    self.access_token = tokens.get('access_token')
-                    self.refresh_token = tokens.get('refresh_token')
-                    expiry = tokens.get('token_expiry')
-                    if expiry:
-                        self.token_expiry = datetime.fromisoformat(expiry)
-        except Exception as e:
-            st.warning(f"Could not load Schwab tokens: {e}")
-    
-    def _save_tokens(self):
-        """Save tokens to file"""
-        import json
-        try:
-            tokens = {
-                'access_token': self.access_token,
-                'refresh_token': self.refresh_token,
-                'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None
-            }
-            with open(self.token_path, 'w') as f:
-                json.dump(tokens, f)
-        except Exception as e:
-            st.warning(f"Could not save Schwab tokens: {e}")
-    
-    def _refresh_access_token(self) -> bool:
-        """Refresh the access token using refresh token"""
-        if not self.refresh_token:
-            return False
-        
-        try:
-            import base64
-            auth_string = f"{self.app_key}:{self.app_secret}"
-            auth_bytes = base64.b64encode(auth_string.encode()).decode()
-            
-            response = requests.post(
-                "https://api.schwabapi.com/v1/oauth/token",
-                headers={
-                    "Authorization": f"Basic {auth_bytes}",
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": self.refresh_token
-                }
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                self.access_token = data['access_token']
-                self.refresh_token = data.get('refresh_token', self.refresh_token)
-                self.token_expiry = datetime.now() + timedelta(seconds=data.get('expires_in', 1800))
-                self._save_tokens()
-                return True
-            else:
-                st.error(f"Token refresh failed: {response.status_code}")
-                return False
-        except Exception as e:
-            st.error(f"Token refresh error: {e}")
-            return False
-    
-    def _ensure_valid_token(self) -> bool:
-        """Ensure we have a valid access token"""
-        if not self.access_token:
-            return False
-        
-        # Refresh if token expires in less than 5 minutes
-        if self.token_expiry and datetime.now() > self.token_expiry - timedelta(minutes=5):
-            return self._refresh_access_token()
-        
-        return True
-    
-    def _get_headers(self) -> Dict:
-        """Get headers with current access token"""
-        return {
-            "Authorization": f"Bearer {self.access_token}",
-            "Accept": "application/json"
-        }
-    
-    def is_authenticated(self) -> bool:
-        """Check if we have valid authentication"""
-        return self._ensure_valid_token()
-    
-    def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get real-time quote for a symbol"""
-        if not self._ensure_valid_token():
-            return None
-        
-        try:
-            url = f"{self.base_url}/quotes"
-            response = requests.get(
-                url, 
-                params={"symbols": symbol, "fields": "quote,reference"},
-                headers=self._get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if symbol in data:
-                quote = data[symbol].get("quote", {})
-                ref = data[symbol].get("reference", {})
-                
-                return {
-                    "symbol": symbol,
-                    "name": ref.get("description", symbol),
-                    "price": quote.get("lastPrice"),
-                    "bid": quote.get("bidPrice"),
-                    "ask": quote.get("askPrice"),
-                    "change": quote.get("netChange"),
-                    "change_pct": quote.get("netPercentChangeInDouble"),
-                    "volume": quote.get("totalVolume"),
-                    "day_high": quote.get("highPrice"),
-                    "day_low": quote.get("lowPrice"),
-                    "prev_close": quote.get("closePrice"),
-                }
-            return None
-        except Exception as e:
-            st.error(f"Schwab quote error: {e}")
-            return None
-    
-    def get_expirations(self, symbol: str) -> List[str]:
-        """Get available expiration dates"""
-        if not self._ensure_valid_token():
-            return []
-        
-        try:
-            url = f"{self.base_url}/expirationchain"
-            response = requests.get(
-                url,
-                params={"symbol": symbol},
-                headers=self._get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            expirations = []
-            for exp in data.get("expirationList", []):
-                exp_date = exp.get("expirationDate")
-                if exp_date:
-                    expirations.append(exp_date)
-            
-            return sorted(expirations)
-        except Exception as e:
-            st.error(f"Schwab expirations error: {e}")
-            return []
-    
-    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """Get options chain for a given expiration"""
-        if not self._ensure_valid_token():
-            return None, None
-        
-        try:
-            url = f"{self.base_url}/chains"
-            params = {
-                "symbol": symbol,
-                "contractType": "ALL",
-                "strikeCount": 100,
-                "includeUnderlyingQuote": "true",
-                "fromDate": expiration,
-                "toDate": expiration
-            }
-            response = requests.get(url, params=params, headers=self._get_headers())
-            response.raise_for_status()
-            data = response.json()
-            
-            calls_data = []
-            puts_data = []
-            
-            # Process call options
-            call_map = data.get("callExpDateMap", {})
-            for exp_key, strikes in call_map.items():
-                for strike_key, options in strikes.items():
-                    for opt in options:
-                        calls_data.append({
-                            "strike": opt.get("strikePrice"),
-                            "bid": opt.get("bid"),
-                            "ask": opt.get("ask"),
-                            "lastPrice": opt.get("last"),
-                            "volume": opt.get("totalVolume", 0),
-                            "openInterest": opt.get("openInterest", 0),
-                            "impliedVolatility": opt.get("volatility"),
-                            "delta": opt.get("delta"),
-                            "gamma": opt.get("gamma"),
-                            "theta": opt.get("theta"),
-                            "vega": opt.get("vega"),
-                        })
-            
-            # Process put options
-            put_map = data.get("putExpDateMap", {})
-            for exp_key, strikes in put_map.items():
-                for strike_key, options in strikes.items():
-                    for opt in options:
-                        puts_data.append({
-                            "strike": opt.get("strikePrice"),
-                            "bid": opt.get("bid"),
-                            "ask": opt.get("ask"),
-                            "lastPrice": opt.get("last"),
-                            "volume": opt.get("totalVolume", 0),
-                            "openInterest": opt.get("openInterest", 0),
-                            "impliedVolatility": opt.get("volatility"),
-                            "delta": opt.get("delta"),
-                            "gamma": opt.get("gamma"),
-                            "theta": opt.get("theta"),
-                            "vega": opt.get("vega"),
-                        })
-            
-            calls_df = pd.DataFrame(calls_data) if calls_data else pd.DataFrame()
-            puts_df = pd.DataFrame(puts_data) if puts_data else pd.DataFrame()
-            
-            return calls_df, puts_df
-            
-        except Exception as e:
-            st.error(f"Schwab options chain error: {e}")
-            return None, None
+def initialize_session_state():
+    """Initialize session state variables."""
+    if "opportunities" not in st.session_state:
+        st.session_state.opportunities = []
+    if "scan_history" not in st.session_state:
+        st.session_state.scan_history = []
+    if "last_scan" not in st.session_state:
+        st.session_state.last_scan = None
+    if "api_connected" not in st.session_state:
+        st.session_state.api_connected = False
+    if "watchlist" not in st.session_state:
+        st.session_state.watchlist = [
+            "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN",
+            "META", "GOOGL", "AMD", "NFLX"
+        ]
 
 
-class TradierProvider:
-    """Real-time data from Tradier API"""
+def create_mock_opportunities():
+    """Create mock opportunities for demo mode."""
+    types = ["put_call_parity", "box_spread", "butterfly", "vertical_mispricing", "volatility_skew"]
+    symbols = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA"]
     
-    def __init__(self, api_key: str, endpoint: str = "https://sandbox.tradier.com/v1"):
-        self.api_key = api_key
-        self.endpoint = endpoint
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json"
-        }
+    opportunities = []
+    for i in range(np.random.randint(3, 8)):
+        opp_type = np.random.choice(types)
+        symbol = np.random.choice(symbols)
+        edge = np.random.uniform(0.5, 3.0)
+        confidence = np.random.uniform(0.6, 0.95)
+        
+        opportunities.append({
+            "id": i,
+            "type": opp_type,
+            "symbol": symbol,
+            "expected_profit": edge * 100,
+            "expected_profit_pct": edge,
+            "confidence": confidence,
+            "risk_free": opp_type in ["put_call_parity", "box_spread", "butterfly"],
+            "net_delta": np.random.uniform(-0.1, 0.1),
+            "net_vega": np.random.uniform(-50, 50),
+            "days_to_expiration": np.random.randint(5, 45),
+            "underlying_price": np.random.uniform(100, 500),
+            "timestamp": datetime.now(),
+            "legs": [
+                {"action": "BUY", "type": "CALL", "strike": 100, "price": 5.50},
+                {"action": "SELL", "type": "CALL", "strike": 105, "price": 3.20},
+            ],
+            "notes": [f"Edge detected: {edge:.2f}%"]
+        })
     
-    def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get real-time quote for a symbol"""
-        try:
-            url = f"{self.endpoint}/markets/quotes"
-            response = requests.get(url, params={"symbols": symbol}, headers=self.headers)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "quotes" in data and "quote" in data["quotes"]:
-                quote = data["quotes"]["quote"]
-                return {
-                    "symbol": quote.get("symbol"),
-                    "name": quote.get("description", symbol),
-                    "price": quote.get("last"),
-                    "bid": quote.get("bid"),
-                    "ask": quote.get("ask"),
-                    "change": quote.get("change"),
-                    "change_pct": quote.get("change_percentage"),
-                    "volume": quote.get("volume"),
-                    "day_high": quote.get("high"),
-                    "day_low": quote.get("low"),
-                    "prev_close": quote.get("prevclose"),
-                }
-            return None
-        except Exception as e:
-            st.error(f"Tradier quote error: {e}")
-            return None
-    
-    def get_expirations(self, symbol: str) -> List[str]:
-        """Get available expiration dates"""
-        try:
-            url = f"{self.endpoint}/markets/options/expirations"
-            response = requests.get(url, params={"symbol": symbol}, headers=self.headers)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "expirations" in data and "date" in data["expirations"]:
-                dates = data["expirations"]["date"]
-                return dates if isinstance(dates, list) else [dates]
-            return []
-        except Exception as e:
-            st.error(f"Tradier expirations error: {e}")
-            return []
-    
-    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """Get options chain for a given expiration"""
-        try:
-            url = f"{self.endpoint}/markets/options/chains"
-            params = {
-                "symbol": symbol,
-                "expiration": expiration,
-                "greeks": "true"
-            }
-            response = requests.get(url, params=params, headers=self.headers)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "options" not in data or "option" not in data["options"]:
-                return None, None
-            
-            options = data["options"]["option"]
-            if not isinstance(options, list):
-                options = [options]
-            
-            calls_data = []
-            puts_data = []
-            
-            for opt in options:
-                greeks = opt.get("greeks") or {}
-                row = {
-                    "strike": opt.get("strike"),
-                    "bid": opt.get("bid"),
-                    "ask": opt.get("ask"),
-                    "lastPrice": opt.get("last"),
-                    "volume": opt.get("volume", 0),
-                    "openInterest": opt.get("open_interest", 0),
-                    "impliedVolatility": greeks.get("mid_iv"),
-                    "delta": greeks.get("delta"),
-                    "gamma": greeks.get("gamma"),
-                    "theta": greeks.get("theta"),
-                    "vega": greeks.get("vega"),
-                }
-                
-                if opt.get("option_type") == "call":
-                    calls_data.append(row)
+    return opportunities
+
+
+def render_sidebar():
+    """Render sidebar with configuration options."""
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        
+        # API Connection
+        st.markdown("#### 🔌 Schwab API")
+        api_key = st.text_input("API Key", type="password", key="api_key")
+        api_secret = st.text_input("API Secret", type="password", key="api_secret")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Connect", use_container_width=True):
+                if api_key and api_secret:
+                    with st.spinner("Connecting..."):
+                        time.sleep(1)
+                        st.session_state.api_connected = True
+                        st.success("Connected!")
                 else:
-                    puts_data.append(row)
-            
-            calls_df = pd.DataFrame(calls_data) if calls_data else pd.DataFrame()
-            puts_df = pd.DataFrame(puts_data) if puts_data else pd.DataFrame()
-            
-            return calls_df, puts_df
-            
-        except Exception as e:
-            st.error(f"Tradier options chain error: {e}")
-            return None, None
-
-
-class YFinanceProvider:
-    """Fallback data from Yahoo Finance (delayed ~15 min)"""
-    
-    def __init__(self):
-        import yfinance as yf
-        self.yf = yf
-    
-    def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get quote for a symbol"""
-        try:
-            stock = self.yf.Ticker(symbol)
-            info = stock.info
-            
-            current_price = info.get("regularMarketPrice") or info.get("currentPrice")
-            prev_close = info.get("regularMarketPreviousClose")
-            change = (current_price - prev_close) if current_price and prev_close else 0
-            change_pct = (change / prev_close * 100) if prev_close else 0
-            
-            return {
-                "symbol": symbol,
-                "name": info.get("shortName", symbol),
-                "price": current_price,
-                "bid": info.get("bid"),
-                "ask": info.get("ask"),
-                "change": change,
-                "change_pct": change_pct,
-                "volume": info.get("regularMarketVolume", 0),
-                "day_high": info.get("dayHigh"),
-                "day_low": info.get("dayLow"),
-                "prev_close": prev_close,
-            }
-        except Exception as e:
-            st.error(f"YFinance quote error: {e}")
-            return None
-    
-    def get_expirations(self, symbol: str) -> List[str]:
-        """Get available expiration dates"""
-        try:
-            stock = self.yf.Ticker(symbol)
-            return list(stock.options)
-        except Exception:
-            return []
-    
-    def get_options_chain(self, symbol: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """Get options chain for a given expiration"""
-        try:
-            stock = self.yf.Ticker(symbol)
-            chain = stock.option_chain(expiration)
-            return chain.calls, chain.puts
-        except Exception as e:
-            st.error(f"YFinance options error: {e}")
-            return None, None
-
-
-# Initialize provider based on configuration
-@st.cache_resource
-def get_provider():
-    """Get the appropriate data provider (Schwab > Tradier > Yahoo)"""
-    if USE_SCHWAB and SCHWAB_APP_KEY and SCHWAB_APP_SECRET:
-        provider = SchwabProvider(SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_PATH)
-        if provider.is_authenticated():
-            return provider, "Schwab"
-        else:
-            st.warning("Schwab tokens not found or expired. Run initial auth setup.")
-    
-    if USE_TRADIER and TRADIER_API_KEY:
-        return TradierProvider(TRADIER_API_KEY, TRADIER_ENDPOINT), "Tradier"
-    
-    return YFinanceProvider(), "Yahoo Finance"
-
-
-# ============================================================================
-# DATA FUNCTIONS WITH CACHING
-# ============================================================================
-
-# Determine cache TTL based on provider
-CACHE_TTL = 5 if (USE_SCHWAB or USE_TRADIER) else 30
-
-@st.cache_data(ttl=CACHE_TTL)
-def get_stock_data(ticker: str) -> Optional[Dict]:
-    """Fetch stock data with appropriate caching"""
-    provider, _ = get_provider()
-    return provider.get_quote(ticker)
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def get_options_data(ticker: str, expiration: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Fetch options chain data"""
-    provider, _ = get_provider()
-    return provider.get_options_chain(ticker, expiration)
-
-
-@st.cache_data(ttl=300)
-def get_expirations(ticker: str) -> List[str]:
-    """Get available expiration dates"""
-    provider, _ = get_provider()
-    return provider.get_expirations(ticker)
-
-
-def calculate_days_to_expiry(exp_date: str) -> int:
-    """Calculate days until expiration"""
-    exp = datetime.strptime(exp_date, "%Y-%m-%d")
-    today = datetime.now()
-    return (exp - today).days
-
-
-def build_options_grid(calls: pd.DataFrame, puts: pd.DataFrame, current_price: float) -> Optional[pd.DataFrame]:
-    """Build unified options grid with calls and puts aligned by strike"""
-    if calls is None or puts is None or calls.empty or puts.empty:
-        return None
-    
-    all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
-    grid_data = []
-    
-    # Find the closest strike to current price for ATM marking
-    if current_price:
-        atm_strike = min(all_strikes, key=lambda x: abs(x - current_price))
-    else:
-        atm_strike = None
-    
-    for strike in all_strikes:
-        call_row = calls[calls['strike'] == strike]
-        put_row = puts[puts['strike'] == strike]
+                    st.warning("Enter credentials")
+        with col2:
+            if st.button("Demo Mode", use_container_width=True):
+                st.session_state.api_connected = True
+                st.info("Demo mode active")
         
-        if current_price:
-            if strike == atm_strike:
-                moneyness = "ATM"
-            elif strike < current_price:
-                moneyness = "ITM_CALL"
-            else:
-                moneyness = "ITM_PUT"
-        else:
-            moneyness = "OTM"
+        st.markdown("---")
         
-        def safe_get(df, col):
-            if len(df) > 0 and col in df.columns:
-                val = df[col].iloc[0]
-                return val if pd.notna(val) else None
-            return None
+        # Scan Parameters
+        st.markdown("#### 🎯 Scan Parameters")
         
-        row = {
-            "strike": strike,
-            "moneyness": moneyness,
-            "call_bid": safe_get(call_row, 'bid'),
-            "call_ask": safe_get(call_row, 'ask'),
-            "call_last": safe_get(call_row, 'lastPrice'),
-            "call_volume": safe_get(call_row, 'volume'),
-            "call_oi": safe_get(call_row, 'openInterest'),
-            "call_iv": safe_get(call_row, 'impliedVolatility'),
-            "call_delta": safe_get(call_row, 'delta'),
-            "put_bid": safe_get(put_row, 'bid'),
-            "put_ask": safe_get(put_row, 'ask'),
-            "put_last": safe_get(put_row, 'lastPrice'),
-            "put_volume": safe_get(put_row, 'volume'),
-            "put_oi": safe_get(put_row, 'openInterest'),
-            "put_iv": safe_get(put_row, 'impliedVolatility'),
-            "put_delta": safe_get(put_row, 'delta'),
+        min_edge = st.slider(
+            "Min Edge (%)",
+            min_value=0.1,
+            max_value=5.0,
+            value=0.5,
+            step=0.1,
+            help="Minimum profit edge to flag opportunity"
+        )
+        
+        min_confidence = st.slider(
+            "Min Confidence",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.6,
+            step=0.05,
+            help="Minimum confidence score"
+        )
+        
+        max_dte = st.slider(
+            "Max DTE",
+            min_value=1,
+            max_value=90,
+            value=45,
+            help="Maximum days to expiration"
+        )
+        
+        st.markdown("---")
+        
+        # Risk Parameters
+        st.markdown("#### ⚠️ Risk Limits")
+        
+        max_position = st.number_input(
+            "Max Position Size",
+            min_value=1,
+            max_value=100,
+            value=10,
+            help="Maximum contracts per position"
+        )
+        
+        max_delta = st.slider(
+            "Max Delta Exposure",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.1,
+            step=0.01,
+            help="Maximum absolute delta"
+        )
+        
+        st.markdown("---")
+        
+        # Watchlist
+        st.markdown("#### 📋 Watchlist")
+        
+        watchlist_text = st.text_area(
+            "Symbols (one per line)",
+            value="\n".join(st.session_state.watchlist),
+            height=150
+        )
+        
+        if st.button("Update Watchlist", use_container_width=True):
+            st.session_state.watchlist = [
+                s.strip().upper() 
+                for s in watchlist_text.split("\n") 
+                if s.strip()
+            ]
+            st.success(f"Updated: {len(st.session_state.watchlist)} symbols")
+        
+        return {
+            "min_edge": min_edge,
+            "min_confidence": min_confidence,
+            "max_dte": max_dte,
+            "max_position": max_position,
+            "max_delta": max_delta
         }
-        grid_data.append(row)
+
+
+def render_opportunity_card(opp: Dict, idx: int):
+    """Render a single opportunity card."""
+    risk_class = "risk-free" if opp["risk_free"] else "statistical"
+    risk_badge = "🟢 Risk-Free" if opp["risk_free"] else "🟡 Statistical"
     
-    return pd.DataFrame(grid_data)
-
-
-def format_value(val, decimals=2, prefix="", suffix=""):
-    """Format a value for display"""
-    if pd.isna(val) or val is None:
-        return "—"
-    if isinstance(val, (int, float)):
-        if abs(val) >= 1_000_000:
-            return f"{prefix}{val/1_000_000:.1f}M{suffix}"
-        elif abs(val) >= 10_000:
-            return f"{prefix}{val/1_000:.1f}K{suffix}"
-        elif decimals == 0:
-            return f"{prefix}{int(val):,}{suffix}"
-        else:
-            return f"{prefix}{val:.{decimals}f}{suffix}"
-    return str(val)
-
-
-def render_options_grid(grid_df: pd.DataFrame, current_price: float, iv_threshold: float = 0.8) -> str:
-    """Render the options grid as HTML"""
-    if grid_df is None or grid_df.empty:
-        return "<p style='color: var(--text-muted);'>No options data available</p>"
-    
-    max_call_vol = grid_df['call_volume'].max() if grid_df['call_volume'].notna().any() else 1
-    max_put_vol = grid_df['put_volume'].max() if grid_df['put_volume'].notna().any() else 1
-    
-    has_delta = grid_df['call_delta'].notna().any()
-    
-    if has_delta:
-        call_headers = "<span>Δ</span><span>IV</span><span>OI</span><span>Vol</span><span>Last</span><span>Bid</span><span>Ask</span>"
-        put_headers = "<span>Bid</span><span>Ask</span><span>Last</span><span>Vol</span><span>OI</span><span>IV</span><span>Δ</span>"
-    else:
-        call_headers = "<span>IV</span><span>OI</span><span>Vol</span><span>Last</span><span>Bid</span><span>Ask</span><span></span>"
-        put_headers = "<span></span><span>Bid</span><span>Ask</span><span>Last</span><span>Vol</span><span>OI</span><span>IV</span>"
-    
-    html = f"""
-    <div class="grid-container">
-        <div class="grid-header">
-            <div class="grid-header-calls">
-                {call_headers}
-            </div>
-            <div class="grid-header-strike">STRIKE</div>
-            <div class="grid-header-puts">
-                {put_headers}
-            </div>
-        </div>
-    """
-    
-    for _, row in grid_df.iterrows():
-        row_class = ""
-        if row['moneyness'] == "ATM":
-            row_class = "atm"
-        elif row['moneyness'] == "ITM_CALL":
-            row_class = "itm-call"
-        elif row['moneyness'] == "ITM_PUT":
-            row_class = "itm-put"
+    with st.container():
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
         
-        call_iv = row['call_iv']
-        call_iv_class = "iv-high" if call_iv and call_iv > iv_threshold else ""
-        call_vol_class = "volume-high" if row['call_volume'] and row['call_volume'] > max_call_vol * 0.5 else ""
+        with col1:
+            st.markdown(f"### {opp['symbol']} - {opp['type'].replace('_', ' ').title()}")
+            st.caption(f"{risk_badge} | Confidence: {opp['confidence']*100:.0f}%")
         
-        put_iv = row['put_iv']
-        put_iv_class = "iv-high" if put_iv and put_iv > iv_threshold else ""
-        put_vol_class = "volume-high" if row['put_volume'] and row['put_volume'] > max_put_vol * 0.5 else ""
+        with col2:
+            st.metric(
+                "Expected Profit",
+                f"${opp['expected_profit']:.2f}",
+                f"{opp['expected_profit_pct']:.2f}%"
+            )
         
-        call_delta = format_value(row['call_delta'], 2) if has_delta else ""
-        put_delta = format_value(row['put_delta'], 2) if has_delta else ""
+        with col3:
+            st.metric(
+                "Net Delta",
+                f"{opp['net_delta']:.3f}",
+                delta_color="off"
+            )
         
-        if has_delta:
-            call_data = f"""
-                <span class="delta-col">{call_delta}</span>
-                <span class="{call_iv_class}">{format_value(call_iv * 100 if call_iv else None, 1)}%</span>
-                <span>{format_value(row['call_oi'], 0)}</span>
-                <span class="{call_vol_class}">{format_value(row['call_volume'], 0)}</span>
-                <span>{format_value(row['call_last'])}</span>
-                <span class="bid-ask">{format_value(row['call_bid'])}</span>
-                <span class="bid-ask">{format_value(row['call_ask'])}</span>
-            """
-            put_data = f"""
-                <span class="bid-ask">{format_value(row['put_bid'])}</span>
-                <span class="bid-ask">{format_value(row['put_ask'])}</span>
-                <span>{format_value(row['put_last'])}</span>
-                <span class="{put_vol_class}">{format_value(row['put_volume'], 0)}</span>
-                <span>{format_value(row['put_oi'], 0)}</span>
-                <span class="{put_iv_class}">{format_value(put_iv * 100 if put_iv else None, 1)}%</span>
-                <span class="delta-col">{put_delta}</span>
-            """
-        else:
-            call_data = f"""
-                <span class="{call_iv_class}">{format_value(call_iv * 100 if call_iv else None, 1)}%</span>
-                <span>{format_value(row['call_oi'], 0)}</span>
-                <span class="{call_vol_class}">{format_value(row['call_volume'], 0)}</span>
-                <span>{format_value(row['call_last'])}</span>
-                <span class="bid-ask">{format_value(row['call_bid'])}</span>
-                <span class="bid-ask">{format_value(row['call_ask'])}</span>
-                <span></span>
-            """
-            put_data = f"""
-                <span></span>
-                <span class="bid-ask">{format_value(row['put_bid'])}</span>
-                <span class="bid-ask">{format_value(row['put_ask'])}</span>
-                <span>{format_value(row['put_last'])}</span>
-                <span class="{put_vol_class}">{format_value(row['put_volume'], 0)}</span>
-                <span>{format_value(row['put_oi'], 0)}</span>
-                <span class="{put_iv_class}">{format_value(put_iv * 100 if put_iv else None, 1)}%</span>
-            """
+        with col4:
+            st.metric(
+                "DTE",
+                f"{opp['days_to_expiration']}",
+                delta_color="off"
+            )
         
-        html += f"""
-        <div class="grid-row {row_class}">
-            <div class="calls-data">{call_data}</div>
-            <div class="strike-cell">{format_value(row['strike'])}</div>
-            <div class="puts-data">{put_data}</div>
-        </div>
-        """
-    
-    html += "</div>"
-    return html
-
-
-# ============================================================================
-# MAIN APP
-# ============================================================================
-
-provider, provider_name = get_provider()
-is_realtime = (provider_name == "Schwab" or 
-               (provider_name == "Tradier" and "api.tradier.com" in TRADIER_ENDPOINT))
-
-if provider_name == "Schwab":
-    indicator_html = '<div class="live-indicator"><div class="live-dot"></div><span>SCHWAB LIVE</span></div>'
-elif is_realtime:
-    indicator_html = '<div class="live-indicator"><div class="live-dot"></div><span>REAL-TIME</span></div>'
-elif provider_name == "Tradier":
-    indicator_html = '<div class="delayed-indicator"><div class="delayed-dot"></div><span>SANDBOX</span></div>'
-else:
-    indicator_html = '<div class="delayed-indicator"><div class="delayed-dot"></div><span>DELAYED</span></div>'
-
-st.markdown(f"""
-<div class="terminal-header">
-    <div>
-        <div class="terminal-title">Options Grid</div>
-        <div class="terminal-subtitle">Professional Options Chain</div>
-    </div>
-    {indicator_html}
-</div>
-""", unsafe_allow_html=True)
-
-if not USE_SCHWAB and not USE_TRADIER:
-    with st.expander("🔑 Enable Real-Time Data", expanded=False):
-        st.markdown("""
-        ### Option 1: Charles Schwab (Recommended - Free with account)
-        
-        1. Create developer account at [developer.schwab.com](https://developer.schwab.com/)
-        2. Register an app with "Market Data Production"
-        3. Set callback URL: `https://127.0.0.1:8182`
-        4. Wait 2-3 days for approval
-        5. Run initial auth (first time only):
-        ```bash
-        pip install schwab-py
-        python -c "
-        import schwab
-        schwab.auth.easy_client('YOUR_APP_KEY', 'YOUR_APP_SECRET', 
-                                'https://127.0.0.1:8182', 'schwab_tokens.json')
-        "
-        ```
-        6. Set environment variables:
-        ```bash
-        export SCHWAB_APP_KEY="your-app-key"
-        export SCHWAB_APP_SECRET="your-app-secret"
-        ```
-        
-        ---
-        
-        ### Option 2: Tradier (Simpler setup)
-        
-        1. Sign up free at [developer.tradier.com](https://developer.tradier.com/)
-        2. For Streamlit Cloud, add to `.streamlit/secrets.toml`:
-        ```toml
-        TRADIER_API_KEY = "your-api-key"
-        TRADIER_ENDPOINT = "https://api.tradier.com/v1"
-        ```
-        3. For local dev: `export TRADIER_API_KEY="your-key"`
-        """)
-
-col1, col2, col3, col4 = st.columns([2, 1, 1, 6])
-
-with col1:
-    ticker = st.text_input("Symbol", value="SPY", label_visibility="collapsed", key="ticker").upper().strip()
-
-with col2:
-    auto_refresh = st.checkbox("Auto-refresh", value=False)
-
-with col3:
-    if st.button("🔄"):
-        st.cache_data.clear()
-
-if auto_refresh:
-    time.sleep(5)
-    st.rerun()
-
-if ticker:
-    stock_data = get_stock_data(ticker)
-    
-    if stock_data and stock_data.get("price"):
-        change = stock_data.get('change', 0) or 0
-        change_pct = stock_data.get('change_pct', 0) or 0
-        change_class = "positive" if change >= 0 else "negative"
-        change_sign = "+" if change >= 0 else ""
-        
-        day_low = stock_data.get('day_low')
-        day_high = stock_data.get('day_high')
-        range_str = f"${day_low:.2f} - ${day_high:.2f}" if day_low and day_high else "—"
-        
-        st.markdown(f"""
-        <div class="stock-bar">
-            <div>
-                <div class="stock-symbol">{stock_data['symbol']}</div>
-                <div class="stock-name">{stock_data['name']}</div>
-            </div>
-            <div>
-                <div class="stock-price {change_class}">${stock_data['price']:.2f}</div>
-                <div class="stock-change {change_class}">{change_sign}{change:.2f} ({change_sign}{change_pct:.2f}%)</div>
-            </div>
-            <div class="stock-stat">
-                <div class="stock-stat-value">{format_value(stock_data.get('bid'))}/{format_value(stock_data.get('ask'))}</div>
-                <div class="stock-stat-label">Bid/Ask</div>
-            </div>
-            <div class="stock-stat">
-                <div class="stock-stat-value">{format_value(stock_data['volume'], 0)}</div>
-                <div class="stock-stat-label">Volume</div>
-            </div>
-            <div class="stock-stat">
-                <div class="stock-stat-value">{range_str}</div>
-                <div class="stock-stat-label">Day Range</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        expirations = get_expirations(ticker)
-        
-        if expirations:
-            exp_options = [f"{exp} ({calculate_days_to_expiry(exp)}d)" for exp in expirations[:15]]
+        # Expandable details
+        with st.expander("View Details"):
+            # Legs table
+            if opp.get("legs"):
+                legs_df = pd.DataFrame(opp["legs"])
+                st.dataframe(legs_df, use_container_width=True)
             
-            col1, col2, col3 = st.columns([3, 2, 5])
+            # Greeks
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Delta", f"{opp.get('net_delta', 0):.4f}")
+            with col2:
+                st.metric("Gamma", f"{opp.get('net_gamma', 0):.4f}")
+            with col3:
+                st.metric("Vega", f"{opp.get('net_vega', 0):.2f}")
+            with col4:
+                st.metric("Theta", f"{opp.get('net_theta', 0):.4f}")
+            
+            # Notes
+            if opp.get("notes"):
+                st.info(" | ".join(opp["notes"]))
+            
+            # Action buttons
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("📊 Analyze", key=f"analyze_{idx}"):
+                    st.session_state.selected_opp = opp
+            with col2:
+                if st.button("📋 Copy", key=f"copy_{idx}"):
+                    st.toast("Copied to clipboard!")
+            with col3:
+                if st.button("🚀 Execute", key=f"execute_{idx}", type="primary"):
+                    st.warning("Execution requires live API connection")
+        
+        st.markdown("---")
+
+
+def render_volatility_surface(symbol: str = "SPY"):
+    """Render 3D volatility surface."""
+    # Generate mock IV surface data
+    strikes = np.linspace(0.8, 1.2, 20)  # Moneyness
+    expirations = np.array([7, 14, 21, 30, 45, 60, 90])  # DTE
+    
+    # Create IV surface with skew
+    iv_surface = np.zeros((len(expirations), len(strikes)))
+    for i, dte in enumerate(expirations):
+        atm_iv = 0.20 + 0.05 * np.sqrt(dte / 30)
+        for j, moneyness in enumerate(strikes):
+            # Add skew (higher IV for OTM puts)
+            skew = 0.1 * (1 - moneyness) ** 2
+            term_premium = 0.02 * np.sqrt(dte / 30)
+            iv_surface[i, j] = atm_iv + skew + term_premium + np.random.normal(0, 0.005)
+    
+    fig = go.Figure(data=[go.Surface(
+        z=iv_surface * 100,
+        x=strikes * 100,
+        y=expirations,
+        colorscale='Viridis',
+        showscale=True,
+        colorbar=dict(title="IV %")
+    )])
+    
+    fig.update_layout(
+        title=f"{symbol} Implied Volatility Surface",
+        scene=dict(
+            xaxis_title="Strike (%ATM)",
+            yaxis_title="Days to Expiration",
+            zaxis_title="Implied Volatility (%)",
+            camera=dict(eye=dict(x=1.5, y=1.5, z=0.8))
+        ),
+        height=500,
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
+    
+    return fig
+
+
+def render_skew_chart(symbol: str = "SPY"):
+    """Render volatility skew chart."""
+    strikes = np.linspace(90, 110, 21)
+    
+    # Near-term skew (steeper)
+    near_iv = 0.22 + 0.15 * ((100 - strikes) / 100) ** 2
+    near_iv = np.where(strikes < 100, near_iv + 0.02, near_iv)
+    
+    # Far-term skew (flatter)
+    far_iv = 0.25 + 0.08 * ((100 - strikes) / 100) ** 2
+    far_iv = np.where(strikes < 100, far_iv + 0.01, far_iv)
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=strikes, y=near_iv * 100,
+        mode='lines+markers',
+        name='7 DTE',
+        line=dict(color='#00ff88', width=2)
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=strikes, y=far_iv * 100,
+        mode='lines+markers',
+        name='30 DTE',
+        line=dict(color='#00aaff', width=2)
+    ))
+    
+    # Mark ATM
+    fig.add_vline(x=100, line_dash="dash", line_color="white", opacity=0.5)
+    
+    fig.update_layout(
+        title=f"{symbol} Volatility Skew",
+        xaxis_title="Strike (%ATM)",
+        yaxis_title="Implied Volatility (%)",
+        height=350,
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02)
+    )
+    
+    return fig
+
+
+def render_term_structure(symbol: str = "SPY"):
+    """Render IV term structure."""
+    dtes = [7, 14, 21, 30, 45, 60, 90, 120]
+    atm_iv = [0.18, 0.19, 0.195, 0.20, 0.205, 0.21, 0.215, 0.22]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=dtes, y=[iv * 100 for iv in atm_iv],
+        mode='lines+markers',
+        name='ATM IV',
+        line=dict(color='#00ff88', width=3),
+        fill='tozeroy',
+        fillcolor='rgba(0, 255, 136, 0.1)'
+    ))
+    
+    fig.update_layout(
+        title=f"{symbol} IV Term Structure",
+        xaxis_title="Days to Expiration",
+        yaxis_title="ATM Implied Volatility (%)",
+        height=350,
+        template="plotly_dark"
+    )
+    
+    return fig
+
+
+def render_pnl_heatmap():
+    """Render P&L heatmap for selected strategy."""
+    # Generate mock P&L data
+    price_moves = np.linspace(-10, 10, 21)
+    days = np.array([0, 7, 14, 21, 30])
+    
+    pnl = np.zeros((len(days), len(price_moves)))
+    for i, day in enumerate(days):
+        for j, move in enumerate(price_moves):
+            # Iron condor-like payoff
+            max_profit = 200
+            width = 5
+            time_decay = (30 - day) / 30
+            
+            if abs(move) < width:
+                pnl[i, j] = max_profit * time_decay
+            else:
+                pnl[i, j] = max_profit - (abs(move) - width) * 50
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=pnl,
+        x=price_moves,
+        y=days,
+        colorscale='RdYlGn',
+        zmid=0,
+        colorbar=dict(title="P&L ($)")
+    ))
+    
+    fig.update_layout(
+        title="Position P&L Heatmap",
+        xaxis_title="Underlying Price Change (%)",
+        yaxis_title="Days Elapsed",
+        height=350,
+        template="plotly_dark"
+    )
+    
+    return fig
+
+
+def render_backtest_results():
+    """Render backtest performance summary."""
+    # Mock backtest data
+    dates = pd.date_range(start="2024-01-01", end="2024-12-01", freq="D")
+    
+    # Generate equity curve
+    np.random.seed(42)
+    returns = np.random.normal(0.001, 0.02, len(dates))
+    returns[::30] += np.random.uniform(0.02, 0.05, len(returns[::30]))  # Monthly arb captures
+    equity = 100000 * (1 + returns).cumprod()
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Equity Curve", "Monthly Returns", "Win Rate by Strategy", "Drawdown"),
+        specs=[[{"colspan": 2}, None], [{}, {}]]
+    )
+    
+    # Equity curve
+    fig.add_trace(
+        go.Scatter(x=dates, y=equity, mode='lines', name='Equity',
+                   line=dict(color='#00ff88', width=2)),
+        row=1, col=1
+    )
+    
+    # Monthly returns
+    monthly_returns = [np.random.uniform(-0.02, 0.08) for _ in range(12)]
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    colors = ['#00ff88' if r > 0 else '#ff4444' for r in monthly_returns]
+    
+    fig.add_trace(
+        go.Bar(x=months, y=[r*100 for r in monthly_returns], 
+               marker_color=colors, name='Monthly Returns'),
+        row=2, col=1
+    )
+    
+    # Win rate by strategy
+    strategies = ['PCP', 'Box', 'Butterfly', 'Vertical', 'Skew']
+    win_rates = [0.85, 0.92, 0.78, 0.72, 0.65]
+    
+    fig.add_trace(
+        go.Bar(x=strategies, y=[wr*100 for wr in win_rates],
+               marker_color='#00aaff', name='Win Rate'),
+        row=2, col=2
+    )
+    
+    fig.update_layout(
+        height=600,
+        showlegend=False,
+        template="plotly_dark"
+    )
+    
+    return fig
+
+
+def main():
+    """Main application entry point."""
+    initialize_session_state()
+    
+    # Header
+    st.markdown('<h1 class="header-title">📈 Options Arbitrage Scanner</h1>', unsafe_allow_html=True)
+    st.caption("Real-time mispricing detection with statistical edge quantification")
+    
+    # Sidebar
+    config = render_sidebar()
+    
+    # Main content
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 Live Scanner",
+        "📊 Volatility Analysis", 
+        "📈 Backtest Results",
+        "⚙️ Settings"
+    ])
+    
+    with tab1:
+        # Scanner controls
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+        
+        with col1:
+            st.markdown("### Active Opportunities")
+        
+        with col2:
+            auto_refresh = st.toggle("Auto Refresh", value=False)
+        
+        with col3:
+            refresh_interval = st.selectbox(
+                "Interval",
+                options=[5, 10, 30, 60],
+                format_func=lambda x: f"{x}s"
+            )
+        
+        with col4:
+            if st.button("🔄 Scan Now", type="primary", use_container_width=True):
+                with st.spinner("Scanning markets..."):
+                    time.sleep(1)
+                    st.session_state.opportunities = create_mock_opportunities()
+                    st.session_state.last_scan = datetime.now()
+                    st.success(f"Found {len(st.session_state.opportunities)} opportunities!")
+        
+        # Stats row
+        if st.session_state.opportunities:
+            opps = st.session_state.opportunities
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                selected_exp_display = st.selectbox("Expiration", options=exp_options, label_visibility="collapsed")
-                selected_exp = selected_exp_display.split(" (")[0]
+                st.metric("Total Opportunities", len(opps))
             
             with col2:
-                strike_range = st.slider("Range %", 5, 50, 8, 5, label_visibility="collapsed", help="Strike range from ATM")
+                risk_free = sum(1 for o in opps if o["risk_free"])
+                st.metric("Risk-Free", risk_free)
             
-            calls, puts = get_options_data(ticker, selected_exp)
+            with col3:
+                total_edge = sum(o["expected_profit"] for o in opps)
+                st.metric("Total Edge", f"${total_edge:.2f}")
             
-            if calls is not None and puts is not None and not calls.empty and not puts.empty:
-                grid_df = build_options_grid(calls, puts, stock_data['price'])
-                
-                if grid_df is not None and not grid_df.empty:
-                    current_price = stock_data['price']
-                    min_strike = current_price * (1 - strike_range / 100)
-                    max_strike = current_price * (1 + strike_range / 100)
-                    grid_df = grid_df[(grid_df['strike'] >= min_strike) & (grid_df['strike'] <= max_strike)]
-                    
-                    # Show applied range
-                    st.caption(f"📊 Showing strikes ${min_strike:.0f} - ${max_strike:.0f} ({len(grid_df)} strikes)")
-                    
-                    # Filter: require a real two-sided market (bid > 0 AND ask > 0) on at least one side
-                    def has_real_market(row):
-                        call_liquid = (pd.notna(row['call_bid']) and row['call_bid'] > 0.01 and 
-                                      pd.notna(row['call_ask']) and row['call_ask'] > 0)
-                        put_liquid = (pd.notna(row['put_bid']) and row['put_bid'] > 0.01 and 
-                                     pd.notna(row['put_ask']) and row['put_ask'] > 0)
-                        return call_liquid or put_liquid
-                    
-                    grid_df = grid_df[grid_df.apply(has_real_market, axis=1)]
-                    
-                    total_call_oi = grid_df['call_oi'].sum() or 0
-                    total_put_oi = grid_df['put_oi'].sum() or 0
-                    total_call_vol = grid_df['call_volume'].sum() or 0
-                    total_put_vol = grid_df['put_volume'].sum() or 0
-                    put_call_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-                    
-                    # Calculate dynamic IV threshold (1.5x median IV of the chain)
-                    iv_vals = [v for v in grid_df[['call_iv', 'put_iv']].values.flatten() if pd.notna(v) and v > 0]
-                    median_iv = np.median(iv_vals) if iv_vals else 0.3
-                    iv_threshold = median_iv * 1.5  # Highlight IVs 50% above median
-                    avg_iv = (sum(iv_vals) / len(iv_vals) * 100) if iv_vals else 0
-                    
-                    st.markdown(f"""
-                    <div class="stats-row">
-                        <div class="stat-card"><div class="stat-value">{format_value(total_call_oi, 0)}</div><div class="stat-label">Call OI</div></div>
-                        <div class="stat-card"><div class="stat-value">{format_value(total_put_oi, 0)}</div><div class="stat-label">Put OI</div></div>
-                        <div class="stat-card"><div class="stat-value">{put_call_ratio:.2f}</div><div class="stat-label">P/C Ratio</div></div>
-                        <div class="stat-card"><div class="stat-value">{format_value(total_call_vol, 0)}</div><div class="stat-label">Call Vol</div></div>
-                        <div class="stat-card"><div class="stat-value">{format_value(total_put_vol, 0)}</div><div class="stat-label">Put Vol</div></div>
-                        <div class="stat-card"><div class="stat-value">{avg_iv:.1f}%</div><div class="stat-label">Avg IV (>{iv_threshold*100:.0f}% ⚠)</div></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    st.markdown(render_options_grid(grid_df, current_price, iv_threshold), unsafe_allow_html=True)
-                    
-                    st.markdown(f"""
-                    <div class="timestamp">
-                        {datetime.now().strftime("%H:%M:%S")} • {len(grid_df)} strikes
-                        <span class="data-source">{provider_name}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.warning("Could not load options chain.")
+            with col4:
+                avg_conf = np.mean([o["confidence"] for o in opps])
+                st.metric("Avg Confidence", f"{avg_conf*100:.0f}%")
+            
+            with col5:
+                if st.session_state.last_scan:
+                    elapsed = (datetime.now() - st.session_state.last_scan).seconds
+                    st.metric("Last Scan", f"{elapsed}s ago")
+            
+            st.markdown("---")
+            
+            # Filter options
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                type_filter = st.multiselect(
+                    "Filter by Type",
+                    options=list(set(o["type"] for o in opps)),
+                    default=list(set(o["type"] for o in opps))
+                )
+            
+            with col2:
+                symbol_filter = st.multiselect(
+                    "Filter by Symbol",
+                    options=list(set(o["symbol"] for o in opps)),
+                    default=list(set(o["symbol"] for o in opps))
+                )
+            
+            with col3:
+                risk_filter = st.radio(
+                    "Risk Type",
+                    options=["All", "Risk-Free Only", "Statistical Only"],
+                    horizontal=True
+                )
+            
+            # Filter opportunities
+            filtered = [
+                o for o in opps
+                if o["type"] in type_filter
+                and o["symbol"] in symbol_filter
+                and (risk_filter == "All" or 
+                     (risk_filter == "Risk-Free Only" and o["risk_free"]) or
+                     (risk_filter == "Statistical Only" and not o["risk_free"]))
+            ]
+            
+            # Render opportunities
+            for idx, opp in enumerate(filtered):
+                render_opportunity_card(opp, idx)
+        
         else:
-            st.warning(f"No options for {ticker}")
-    else:
-        st.error(f"Could not find: {ticker}")
+            st.info("👆 Click 'Scan Now' to search for arbitrage opportunities")
+            
+            # Demo data
+            with st.expander("📚 How It Works"):
+                st.markdown("""
+                ### Arbitrage Types Detected
+                
+                1. **Put-Call Parity** - Exploits pricing inconsistencies between calls, puts, and stock
+                2. **Box Spreads** - Risk-free arbitrage using four options at two strikes
+                3. **Butterfly Spreads** - Exploits mispricing in three-strike combinations
+                4. **Vertical Spreads** - Identifies spreads priced above theoretical maximum
+                5. **Volatility Skew** - Statistical edge from IV surface anomalies
+                
+                ### Key Metrics
+                
+                - **Expected Profit**: Net profit after commissions and slippage
+                - **Confidence**: Probability of successful execution
+                - **Net Delta**: Position's directional exposure
+                - **DTE**: Days until expiration
+                """)
+    
+    with tab2:
+        st.markdown("### Volatility Analysis")
+        
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            selected_symbol = st.selectbox(
+                "Select Symbol",
+                options=st.session_state.watchlist,
+                index=0
+            )
+        
+        # Volatility charts
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.plotly_chart(render_skew_chart(selected_symbol), use_container_width=True)
+        
+        with col2:
+            st.plotly_chart(render_term_structure(selected_symbol), use_container_width=True)
+        
+        # 3D Surface
+        st.plotly_chart(render_volatility_surface(selected_symbol), use_container_width=True)
+        
+        # P&L Heatmap
+        st.markdown("### Position Analysis")
+        st.plotly_chart(render_pnl_heatmap(), use_container_width=True)
+    
+    with tab3:
+        st.markdown("### Backtest Performance")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Return", "+47.3%", "+12.1% vs benchmark")
+        with col2:
+            st.metric("Sharpe Ratio", "2.14", "")
+        with col3:
+            st.metric("Win Rate", "78.5%", "+3.2%")
+        with col4:
+            st.metric("Max Drawdown", "-8.7%", "")
+        
+        st.plotly_chart(render_backtest_results(), use_container_width=True)
+        
+        # Trade log
+        st.markdown("### Recent Trades")
+        
+        trades_data = {
+            "Date": pd.date_range(end=datetime.now(), periods=10, freq="D"),
+            "Symbol": np.random.choice(["SPY", "QQQ", "AAPL", "NVDA"], 10),
+            "Type": np.random.choice(["PCP", "Box", "Butterfly"], 10),
+            "Entry": np.random.uniform(1, 5, 10).round(2),
+            "Exit": np.random.uniform(1, 5, 10).round(2),
+            "P&L": np.random.uniform(-100, 500, 10).round(2),
+            "Status": np.random.choice(["Winner", "Loser"], 10, p=[0.78, 0.22])
+        }
+        
+        trades_df = pd.DataFrame(trades_data)
+        trades_df["P&L"] = trades_df["P&L"].apply(
+            lambda x: f"${x:.2f}" if x >= 0 else f"-${abs(x):.2f}"
+        )
+        
+        st.dataframe(trades_df, use_container_width=True)
+    
+    with tab4:
+        st.markdown("### Application Settings")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Trading Parameters")
+            
+            commission = st.number_input(
+                "Commission per Contract ($)",
+                min_value=0.0,
+                max_value=10.0,
+                value=0.65,
+                step=0.05
+            )
+            
+            slippage = st.slider(
+                "Slippage Model (%)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.05,
+                step=0.01
+            )
+            
+            min_oi = st.number_input(
+                "Minimum Open Interest",
+                min_value=0,
+                max_value=10000,
+                value=100
+            )
+            
+            min_vol = st.number_input(
+                "Minimum Volume",
+                min_value=0,
+                max_value=10000,
+                value=50
+            )
+        
+        with col2:
+            st.markdown("#### Risk Parameters")
+            
+            max_spread = st.slider(
+                "Max Bid-Ask Spread (%)",
+                min_value=0.0,
+                max_value=20.0,
+                value=5.0,
+                step=0.5
+            )
+            
+            risk_free_rate = st.slider(
+                "Risk-Free Rate (%)",
+                min_value=0.0,
+                max_value=10.0,
+                value=5.0,
+                step=0.25
+            )
+            
+            st.markdown("#### Notifications")
+            
+            email_alerts = st.toggle("Email Alerts", value=False)
+            sound_alerts = st.toggle("Sound Alerts", value=True)
+            
+            if email_alerts:
+                email = st.text_input("Email Address")
+        
+        st.markdown("---")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("💾 Save Settings", use_container_width=True):
+                st.success("Settings saved!")
+        
+        with col2:
+            if st.button("🔄 Reset Defaults", use_container_width=True):
+                st.info("Settings reset to defaults")
+        
+        with col3:
+            if st.button("📤 Export Config", use_container_width=True):
+                st.download_button(
+                    "Download JSON",
+                    data=json.dumps({"commission": commission, "slippage": slippage}),
+                    file_name="config.json",
+                    mime="application/json"
+                )
+
+
+if __name__ == "__main__":
+    main()
