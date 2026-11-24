@@ -1,6 +1,6 @@
 # optarb: option no-arbitrage checks at executable prices
 
-[![CI](https://github.com/vincentdamato/optionarbitrage/actions/workflows/ci.yml/badge.svg)](https://github.com/vincentdamato/optionarbitrage/actions/workflows/ci.yml)
+[![CI](https://github.com/vincentdamato/OptionArbitrage/actions/workflows/ci.yml/badge.svg)](https://github.com/vincentdamato/OptionArbitrage/actions/workflows/ci.yml)
 
 `optarb` scans an option chain for violations of model-free no-arbitrage bounds, priced the way you
 would actually trade them: buy at the ask, sell at the bid, then pay commissions and stock borrow. It
@@ -51,8 +51,8 @@ volatility point, rho per percentage point. Every analytic Greek is tested again
 ## Quickstart
 
 ```bash
-git clone https://github.com/vincentdamato/optionarbitrage.git
-cd optionarbitrage
+git clone https://github.com/vincentdamato/OptionArbitrage.git
+cd OptionArbitrage
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[app,dev]"
 
