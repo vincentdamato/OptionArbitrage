@@ -1,282 +1,140 @@
-# 📈 Options Arbitrage Scanner
+# optarb: option no-arbitrage checks at executable prices
 
-A sophisticated quantitative options screener for detecting **mispricing opportunities** with real-time Schwab API integration, statistical analysis, and comprehensive backtesting.
+[![CI](https://github.com/vincentdamato/optionarbitrage/actions/workflows/ci.yml/badge.svg)](https://github.com/vincentdamato/optionarbitrage/actions/workflows/ci.yml)
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-red.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+`optarb` scans an option chain for violations of model-free no-arbitrage bounds, priced the way you
+would actually trade them: buy at the ask, sell at the bid, then pay commissions and stock borrow. It
+also asks the research question that a screener on its own can't answer: **how often do these bounds
+really break in recorded data, by how much after costs, and for how long?**
 
-## 🎯 Features
+It is a read-only research tool. It reads market data and never connects to an account or places an
+order.
 
-### Arbitrage Detection
-- **Put-Call Parity** violations with synthetic pricing
-- **Box Spread** arbitrage (risk-free rate arbitrage)
-- **Butterfly** mispricing detection
-- **Vertical Spread** arbitrage
-- **Calendar Spread** anomalies
-- **Volatility Skew** statistical arbitrage
+## What it checks
 
-### Real-Time Market Data
-- **Schwab API** integration for live options chains
-- Complete Greeks (Delta, Gamma, Theta, Vega, Rho)
-- Second-order Greeks (Vanna, Charm, Vomma)
-- IV surface analysis
+All prices are per share. Edges are reported in dollars per package, with the 100-share multiplier.
 
-### Statistical Analysis
-- Z-score based opportunity scoring
-- Monte Carlo simulations for P&L distribution
-- VaR and CVaR risk metrics
-- Volatility regime detection
-- IV term structure analysis
-- Put/Call skew quantification
+| Check | Bound | Applies to |
+|---|---|---|
+| Strike monotonicity | C(K1) >= C(K2) and P(K1) <= P(K2) for K1 < K2 | all |
+| Vertical width | C(K1) - C(K2) <= K2 - K1, and the same for puts | all |
+| Butterfly convexity | (K3 - K1) V(K2) <= (K3 - K2) V(K1) + (K2 - K1) V(K3) | all, any strike spacing |
+| Box bounds | 0 <= box <= K2 - K1 | European only |
+| Parity band | S - D - K <= C - P <= S - K e^(-rT) | American only |
+| Calendar | V(K, T2) >= V(K, T1) for T2 > T1 | American only |
+| Box vs funding | box-implied rate against your reference rate | European, rate-relative |
 
-### Backtesting Engine
-- Walk-forward optimization
-- Realistic transaction cost modeling
-- Slippage simulation
-- Comprehensive performance metrics (Sharpe, Sortino, Calmar)
-- Win rate analysis by strategy type
+Exercise style decides which bounds hold. Boxes are only checked on European options (SPX, XSP),
+because early assignment on American legs breaks the guaranteed payoff. Calendars are only checked
+on American options, because a deep in-the-money European put can rightly be worth less with more
+time to expiry. The butterfly check uses the strike gaps as weights, so uneven strikes are handled
+without false positives.
 
-## 🚀 Quick Start
+The model-free checks need no rate, volatility or dividend input. Rate-relative checks are kept
+separate and only run when you supply a reference rate.
 
-### Installation
+### Market-implied forwards
 
-```bash
-# Clone the repository
-git clone https://github.com/vincentdamato/OptionArbitrage.git
-cd OptionArbitrage
+For each expiry, the implied forward F and discount factor DF come from a weighted least-squares fit
+of put-call parity, `C - P = DF * F - DF * K`, across strikes near the money, weighted by the inverse
+bid/ask spread. Strikes far off the line (a stale or mispriced quote) are dropped before the final fit.
+This replaces a hard-coded risk-free rate and a guessed dividend yield with what the market implies.
+For American options the fit is labeled approximate.
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+### Pricing and Greeks
 
-# Install dependencies
-pip install -r requirements.txt
-```
+`optarb.pricing` has Black-Scholes-Merton with a continuous dividend yield, Black-76, a vectorized
+Cox-Ross-Rubinstein tree for American options and closed-form Greeks (delta, gamma, theta, vega, rho,
+vanna, charm, vomma, speed). Units are explicit: theta and charm per calendar day, vega and vanna per
+volatility point, rho per percentage point. Every analytic Greek is tested against finite differences.
 
-### Configuration
-
-Create a `.env` file with your Schwab API credentials:
-
-```env
-SCHWAB_API_KEY=your_api_key_here
-SCHWAB_APP_SECRET=your_app_secret_here
-SCHWAB_CALLBACK_URL=https://127.0.0.1:8182
-```
-
-### Running the Dashboard
+## Quickstart
 
 ```bash
-streamlit run app.py
+git clone https://github.com/vincentdamato/optionarbitrage.git
+cd optionarbitrage
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[app,dev]"
+
+pytest                       # 56 tests
+streamlit run app.py         # dashboard on the demo snapshot
+
+optarb sample --out data/sample
+optarb scan data/sample/XSP/*.parquet
+optarb forwards data/sample/XSP/*.parquet
 ```
 
-### Using the CLI
+The demo snapshot is **synthetic**: a model-priced, XSP-like chain with three violations planted on
+purpose so the checks have something to find. The app and the CLI label it as synthetic everywhere it
+appears. A clean synthetic chain (no planted violations) produces zero model-free flags, and that is
+one of the tests.
+
+## The research study
 
 ```bash
-# Scan for opportunities
-python cli.py scan -s SPY QQQ AAPL NVDA
-
-# Analyze a specific symbol
-python cli.py analyze SPY --detailed
-
-# Run backtest
-python cli.py backtest -s 2024-01-01 -e 2024-12-01
-
-# Continuous monitoring
-python cli.py watch -i 60 --min-edge 50
+optarb simulate --out data/simulated --n 40          # synthetic series, to see the pipeline work
+optarb study data/simulated --out reports/simulated --rate 0.045
 ```
 
-## 📊 Architecture
+`optarb study` reads a folder of snapshots with DuckDB, runs every check on each one and writes
+`report.md` plus CSVs:
 
-```
-OptionArbitrage/
-├── api/                    # Schwab API client
-│   └── schwab_client.py    # Real-time market data
-├── analysis/               # Quantitative analysis
-│   ├── greeks_engine.py    # Black-Scholes & Greeks
-│   └── statistical_analyzer.py  # Statistical methods
-├── strategies/             # Arbitrage detection
-│   └── arbitrage_scanner.py  # Multi-strategy scanner
-├── backtesting/            # Strategy validation
-│   └── backtest_engine.py  # Walk-forward backtesting
-├── core/                   # Orchestration
-│   └── orchestrator.py     # Main coordinator
-├── utils/                  # Utilities
-│   └── helpers.py          # Helper functions
-├── config/                 # Configuration
-│   └── settings.py         # Pydantic settings
-├── app.py                  # Streamlit dashboard
-└── cli.py                  # Command-line interface
-```
+- **Frequency:** the share of snapshots with at least one violation, by check.
+- **Size:** the best net edge after costs, in dollars per package.
+- **Persistence:** episodes of the same check broken at the same expiry in consecutive snapshots, and
+  how long they lasted.
+- **Box-implied rates:** the best lending and borrowing rates boxes offered after commissions, per
+  expiry, against your reference rate.
 
-## 🔬 Arbitrage Types Explained
+The simulated series has known, planted violations, so the persistence measure has a known answer to
+recover (it is tested). **The real result needs recorded data.**
 
-### 1. Put-Call Parity (Risk-Free)
-Exploits pricing inconsistencies between calls, puts, and the underlying stock.
+### Recording real chains
 
-**Formula:** `C - P = S - K * e^(-rT)`
+`optarb record` saves option chains from the Schwab Trader API to Parquet. It only reads market data.
 
-When violated:
-- **Conversion**: Sell call + Buy put + Buy stock
-- **Reversal**: Buy call + Sell put + Short stock
-
-### 2. Box Spread (Risk-Free)
-Combines a bull call spread with a bear put spread to lock in risk-free profit.
-
-**Value at expiration:** `K₂ - K₁`
-**Present value:** `(K₂ - K₁) * e^(-rT)`
-
-### 3. Butterfly Spread
-Exploits mispricing in three-strike combinations. A properly priced butterfly should never have negative value.
-
-### 4. Volatility Skew (Statistical)
-Identifies options with implied volatility significantly deviating from the surface norm (z-score > 2).
-
-## ⚙️ Configuration Options
-
-### Scan Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `min_edge_pct` | 0.5% | Minimum profit edge to flag |
-| `commission_per_contract` | $0.65 | Trading commission |
-| `slippage_pct` | 0.05% | Expected slippage |
-| `min_open_interest` | 100 | Minimum OI filter |
-| `min_volume` | 50 | Minimum volume filter |
-| `max_bid_ask_spread_pct` | 5% | Max spread filter |
-
-### Risk Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max_position_size` | 10 | Max contracts per trade |
-| `max_delta_exposure` | 0.10 | Max absolute delta |
-| `max_total_exposure` | $10,000 | Max capital at risk |
-| `daily_loss_limit` | $2,000 | Max daily loss |
-
-## 📈 Greeks Calculation
-
-The platform calculates comprehensive Greeks:
-
-### First-Order Greeks
-- **Delta (Δ)**: Rate of change of option price with underlying
-- **Gamma (Γ)**: Rate of change of delta
-- **Theta (Θ)**: Time decay (daily)
-- **Vega (ν)**: Sensitivity to volatility
-- **Rho (ρ)**: Sensitivity to interest rates
-
-### Second-Order Greeks
-- **Vanna**: d(Delta)/d(Vol) - delta's sensitivity to volatility
-- **Charm**: d(Delta)/d(Time) - delta decay
-- **Vomma**: d(Vega)/d(Vol) - vega convexity
-- **Speed**: d(Gamma)/d(Spot) - gamma's sensitivity to price
-
-## 🧪 Backtesting
-
-The backtesting engine includes:
-
-- **Walk-Forward Optimization**: Prevents overfitting
-- **Realistic Costs**: Commission and slippage modeling
-- **Monte Carlo**: P&L distribution simulation
-- **Risk Metrics**: VaR, CVaR, max drawdown
-
-```python
-from backtesting import BacktestEngine
-
-engine = BacktestEngine(
-    initial_capital=100000,
-    commission_per_contract=0.65,
-    slippage_model="proportional"
-)
-
-result = engine.run_arbitrage_backtest(opportunities)
-print(engine.generate_performance_report(result))
+```bash
+pip install -e ".[schwab]"
+export SCHWAB_API_KEY=...  SCHWAB_APP_SECRET=...      # from your Schwab developer app
+optarb record SPY QQQ '$XSP' --every 5 --count 78 --out data/recorded --login
+optarb study data/recorded --out reports/recorded --rate 0.045
 ```
 
-## 📚 API Reference
+Recorded chains stay on your machine. `data/` is in `.gitignore`, because exchange data usually can't
+be redistributed. Commit the report, not the quotes.
 
-### SchwabClient
+## What a flag does not tell you
 
-```python
-from api import SchwabClient
+- Quotes in a snapshot are not guaranteed to be simultaneous, and the bid or ask may be for one contract.
+- A flag says the quotes crossed a bound, not that you would have been filled.
+- American parity bounds depend on the dividend you supply; a missed dividend shows up as a false
+  reversal.
+- Short stock legs assume the stock is borrowable at the fee you set.
 
-client = SchwabClient(
-    api_key="your_key",
-    app_secret="your_secret"
-)
+These are exactly what the study is meant to measure, which is why it reports persistence and size
+after costs rather than a count of flags.
 
-# Get options chain
-chain = client.get_option_chain(
-    symbol="SPY",
-    min_dte=1,
-    max_dte=60
-)
+## Layout
 
-# Get real-time quote
-quote = client.get_quote("SPY")
+```
+optarb/
+  models.py        quotes, chains, exercise style, year fractions
+  pricing.py       BSM, Black-76, CRR American, Greeks, implied vol
+  forwards.py      implied forward and discount factor per expiry
+  arbitrage.py     the checks, executable pricing, costs, box-implied rates
+  smile.py         implied-vol smile per expiry (relative value, not arbitrage)
+  volatility.py    close-to-close, Parkinson and Garman-Klass realized vol
+  snapshot.py      Parquet snapshot I/O
+  store.py         DuckDB over a folder of snapshots
+  study.py         the research study and report
+  cli.py           optarb command line
+  providers/
+    schwab.py      read-only Schwab chain provider and parser
+    synthetic.py   seeded synthetic chains with optional planted violations
+app.py             Streamlit dashboard
+tests/             pytest suite, run in CI on Python 3.11 and 3.12
 ```
 
-### ArbitrageScanner
+## License
 
-```python
-from strategies import ArbitrageScanner
-
-scanner = ArbitrageScanner(
-    min_edge_pct=0.5,
-    commission_per_contract=0.65
-)
-
-opportunities = scanner.scan_chain(chain)
-```
-
-### GreeksCalculator
-
-```python
-from analysis import GreeksCalculator
-
-calc = GreeksCalculator()
-
-# Calculate all Greeks
-greeks = calc.calculate_all_greeks(
-    S=100,      # Spot price
-    K=100,      # Strike
-    T=0.25,     # Time to exp (years)
-    r=0.05,     # Risk-free rate
-    sigma=0.20, # Volatility
-    option_type="call"
-)
-
-# Calculate implied volatility
-iv = calc.implied_volatility(
-    market_price=5.50,
-    S=100, K=100, T=0.25, r=0.05
-)
-```
-
-## 🛡️ Risk Management
-
-The platform enforces multiple risk controls:
-
-1. **Position Limits**: Maximum contracts per position
-2. **Delta Limits**: Maximum directional exposure
-3. **Daily Loss Limits**: Automatic halt on excessive losses
-4. **Liquidity Filters**: Minimum volume/OI requirements
-5. **Spread Filters**: Maximum bid-ask spread
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our contributing guidelines and submit pull requests.
-
-## ⚠️ Disclaimer
-
-This software is for educational and research purposes only. Options trading involves significant risk of loss. Past performance does not guarantee future results. Always conduct your own analysis and consult with a qualified financial advisor before trading.
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## 🙏 Acknowledgments
-
-- [schwab-py](https://github.com/alexgolec/schwab-py) for Schwab API wrapper
-- [QuantLib](https://www.quantlib.org/) for options pricing reference
-- [Streamlit](https://streamlit.io/) for the dashboard framework
+MIT. See [LICENSE](LICENSE).
