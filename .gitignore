@@ -140,3 +140,5 @@ logs/
 
 # Schwab API tokens
 ~/.schwab/
+# Study output and local data
+reports/
