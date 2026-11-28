@@ -43,6 +43,15 @@ class OptionQuote:
     open_interest: int = 0
     vendor_iv: float | None = None  # decimal, as reported by the data source
     contract_symbol: str = ""
+    bid_size: int = 0  # contracts shown at the bid; 0 when the source doesn't say
+    ask_size: int = 0
+    quote_time: datetime | None = None  # when this quote was last updated, if the source says
+    # Greeks as reported by the data source, in this package's units (see optarb.pricing)
+    vendor_delta: float | None = None
+    vendor_gamma: float | None = None
+    vendor_theta: float | None = None
+    vendor_vega: float | None = None
+    vendor_rho: float | None = None
 
     @property
     def mid(self) -> float:
@@ -84,6 +93,14 @@ class OptionsChain:
     exercise_style: ExerciseStyle
     quotes: list[OptionQuote] = field(default_factory=list)
     source: str = "unknown"  # e.g. "synthetic", "schwab"
+    delayed: bool = False  # True when the source says these quotes are delayed
+    vendor_rate: float | None = None  # risk-free rate the source used for its Greeks, decimal
+
+    def replace_quotes(self, quotes: list[OptionQuote]) -> OptionsChain:
+        """Same snapshot with a different set of quotes."""
+        return OptionsChain(
+            self.underlying, self.asof, self.exercise_style, quotes, self.source, self.delayed, self.vendor_rate
+        )
 
     def __post_init__(self) -> None:
         if self.asof.tzinfo is None:

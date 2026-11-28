@@ -48,6 +48,25 @@ Cox-Ross-Rubinstein tree for American options and closed-form Greeks (delta, gam
 vanna, charm, vomma, speed). Units are explicit: theta and charm per calendar day, vega and vanna per
 volatility point, rho per percentage point. Every analytic Greek is tested against finite differences.
 
+### Implied vol and Greeks from the quotes themselves
+
+`optarb.greeks` prices every two-sided quote in a snapshot and returns its IV and Greeks next to the
+ones the data source reported, when it reports them (Schwab does).
+
+- European chains (SPX, XSP): Black-76 on the forward and discount factor implied by parity at that
+  expiry, so no rate or dividend is assumed.
+- American chains (equities, ETFs): IV by root-finding on the CRR tree; delta, gamma and theta from
+  the tree's own early nodes, vega and rho by bumping. The rate is the one you pass, else the rate the
+  source reported, else 4.5%, and each row says which (`rate_source`).
+- `vendor_comparison` gives the median and 90th percentile gap and the median ratio for IV and each
+  Greek. A ratio near 1 means the units agree; near 100 or 0.01 means a unit mismatch, not a pricing gap.
+- `surface_summary` gives ATM IV, 25-delta put and call IV, the 25-delta risk reversal and butterfly
+  per expiry, in vol points.
+
+Real chains are messy, so the Schwab parser drops non-standard (adjusted) contracts and minis, turns
+`-999` and `"NaN"` placeholders into missing values, and keeps quote sizes, quote times and the delayed
+flag. The scan can then skip thin quotes (`--min-size`) and stale ones (`--max-quote-age` seconds).
+
 ## Quickstart
 
 ```bash
@@ -56,7 +75,7 @@ cd OptionArbitrage
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[app,dev]"
 
-pytest                       # 56 tests
+pytest                       # 82 tests
 streamlit run app.py         # dashboard on the demo snapshot
 
 optarb sample --out data/sample
@@ -91,17 +110,40 @@ recover (it is tested). **The real result needs recorded data.**
 
 ### Recording real chains
 
-`optarb record` saves option chains from the Schwab Trader API to Parquet. It only reads market data.
+Chains come from a swappable source: live Schwab market data, or Schwab JSON saved earlier and
+replayed through the same parser. Everything downstream (snapshots, scan, Greeks, study) runs the same
+code either way, which is how the whole workflow is tested without a Schwab login.
 
 ```bash
 pip install -e ".[schwab]"
 export SCHWAB_API_KEY=...  SCHWAB_APP_SECRET=...      # from your Schwab developer app
-optarb record SPY QQQ '$XSP' --every 5 --count 78 --out data/recorded --login
+optarb doctor                                        # yes/no checks only; never prints a secret
+optarb record SPY --login                            # first time only: browser sign-in, saves a token
+
+# one trading day: record every 5 minutes until 4 pm New York, then write the study report
+optarb session SPY QQQ '$XSP' --every 5 --until-close --save-raw --max-quote-age 120
+
+optarb greeks data/recorded/SPY/SPY_20261120T153000Z.parquet --csv reports/spy_greeks.csv
 optarb study data/recorded --out reports/recorded --rate 0.045
 ```
 
-Recorded chains stay on your machine. `data/` is in `.gitignore`, because exchange data usually can't
-be redistributed. Commit the report, not the quotes.
+Replaying saved payloads instead of calling Schwab:
+
+```bash
+optarb session SPY --source recorded --replay data/recorded/raw/SPY --out data/replayed
+optarb import-schwab saved_chain.json --out data/recorded    # one payload, one snapshot
+```
+
+The study report adds two sections when it has the data: the IV surface over the session (ATM, risk
+reversal and butterfly per expiry) and how our IV and Greeks compare with Schwab's.
+
+Schwab's refresh token lasts 7 days, after which `--login` is needed again; `optarb doctor` warns when
+the token is close to that. The token lives in `~/.optarb/` (or `SCHWAB_TOKEN_PATH`), never in the repo.
+`tests/fixtures/schwab_spy_chain.json` is a model-built chain laid out like a Schwab response, with the
+quirks of real payloads; it is not market data.
+
+Recorded chains stay on your machine. `data/` and `reports/` are in `.gitignore`, because exchange data
+usually can't be redistributed. Share the write-up, not the quotes.
 
 ## What a flag does not tell you
 
@@ -121,6 +163,7 @@ optarb/
   models.py        quotes, chains, exercise style, year fractions
   pricing.py       BSM, Black-76, CRR American, Greeks, implied vol
   forwards.py      implied forward and discount factor per expiry
+  greeks.py        IV and Greeks per quote, surface summary, comparison with vendor Greeks
   arbitrage.py     the checks, executable pricing, costs, box-implied rates
   smile.py         implied-vol smile per expiry (relative value, not arbitrage)
   volatility.py    close-to-close, Parkinson and Garman-Klass realized vol
@@ -129,10 +172,13 @@ optarb/
   study.py         the research study and report
   cli.py           optarb command line
   providers/
-    schwab.py      read-only Schwab chain provider and parser
+    base.py        the chain-source interface record and session use
+    schwab.py      read-only Schwab chain provider, parser and setup check
+    recorded.py    replays saved Schwab JSON through the same parser
     synthetic.py   seeded synthetic chains with optional planted violations
 app.py             Streamlit dashboard
 tests/             pytest suite, run in CI on Python 3.11 and 3.12
+  fixtures/        model-built Schwab-format chain and the script that makes it
 ```
 
 ## License

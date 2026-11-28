@@ -97,13 +97,10 @@ def implied_vol(
     return black76_implied_vol(price, S * math.exp((r - q) * T), K, T, math.exp(-r * T), right)
 
 
-def crr_american_price(
-    S: float, K: float, T: float, r: float, sigma: float, right: Right | str, q: float = 0.0, steps: int = 400
-) -> float:
-    """American option price on a Cox-Ross-Rubinstein binomial tree with a continuous dividend yield."""
-    right = _right(right)
-    if T <= 0 or sigma <= 0:
-        return intrinsic(S, K, right)
+def _crr_tree(
+    S: float, K: float, T: float, r: float, sigma: float, right: Right, q: float, steps: int
+) -> tuple[float, np.ndarray, np.ndarray, float, float]:
+    """Backward induction on a CRR tree. Returns (value, values at step 1, values at step 2, dt, u)."""
     dt = T / steps
     u = math.exp(sigma * math.sqrt(dt))
     d = 1.0 / u
@@ -115,11 +112,47 @@ def crr_american_price(
     spots = S * u ** (steps - j) * d**j
     sign = 1.0 if right is Right.CALL else -1.0
     values = np.maximum(sign * (spots - K), 0.0)
-    for _ in range(steps):
-        spots = spots[:-1] * d  # one step back: S u^(n-j) d^j
+    step1 = step2 = values
+    for n in range(steps, 0, -1):
+        spots = spots[:-1] * d  # one step back: S u^(n-1-j) d^j
         continuation = disc * (p * values[:-1] + (1.0 - p) * values[1:])
         values = np.maximum(continuation, sign * (spots - K))
-    return float(values[0])
+        if n == 3:
+            step2 = values.copy()
+        elif n == 2:
+            step1 = values.copy()
+    return float(values[0]), step1, step2, dt, u
+
+
+def crr_american_price(
+    S: float, K: float, T: float, r: float, sigma: float, right: Right | str, q: float = 0.0, steps: int = 400
+) -> float:
+    """American option price on a Cox-Ross-Rubinstein binomial tree with a continuous dividend yield."""
+    right = _right(right)
+    if T <= 0 or sigma <= 0:
+        return intrinsic(S, K, right)
+    return _crr_tree(S, K, T, r, sigma, right, q, steps)[0]
+
+
+def crr_implied_vol(
+    price: float, S: float, K: float, T: float, r: float, right: Right | str, q: float = 0.0, steps: int = 150
+) -> float | None:
+    """Implied volatility of an American option on the CRR tree. None outside the no-arbitrage range."""
+    right = _right(right)
+    if T <= 0 or price <= 0 or price < intrinsic(S, K, right) + 1e-6:
+        return None
+
+    def objective(sigma: float) -> float:
+        return crr_american_price(S, K, T, r, sigma, right, q, steps) - price
+
+    lo = max(1e-3, 1.5 * abs(r - q) * math.sqrt(T / steps) + 1e-4)  # keeps the tree probability inside (0, 1)
+    hi = 5.0
+    try:
+        if objective(lo) > 0 or objective(hi) < 0:
+            return None
+        return float(brentq(objective, lo, hi, xtol=1e-7))
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -188,3 +221,39 @@ def bsm_greeks(S: float, K: float, T: float, r: float, sigma: float, right: Righ
         vomma=vomma_full / 10_000.0,
         speed=speed,
     )
+
+
+def crr_american_greeks(
+    S: float, K: float, T: float, r: float, sigma: float, right: Right | str, q: float = 0.0, steps: int = 300
+) -> Greeks:
+    """Price and Greeks of an American option on the CRR tree, in the module's units.
+
+    Delta, gamma and theta come from the tree's own early nodes (Hull, chapter 21); vega and rho come
+    from central bumps of one vol point and one basis point. Second-order cross Greeks are not computed
+    and are NaN.
+    """
+    right = _right(right)
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return bsm_greeks(S, K, T, r, sigma, right, q)
+    price, v1, v2, dt, u = _crr_tree(S, K, T, r, sigma, right, q, steps)
+    d = 1.0 / u
+    delta = (v1[0] - v1[1]) / (S * u - S * d)
+    delta_up = (v2[0] - v2[1]) / (S * u * u - S)
+    delta_dn = (v2[1] - v2[2]) / (S - S * d * d)
+    gamma = (delta_up - delta_dn) / (0.5 * (S * u * u - S * d * d))
+    theta_year = (v2[1] - price) / (2.0 * dt)
+    hv, hr = 0.01, 1e-4
+    vega = (
+        crr_american_price(S, K, T, r, sigma + hv, right, q, steps)
+        - crr_american_price(S, K, T, r, max(sigma - hv, 1e-4), right, q, steps)
+    ) / 2.0
+    rho = (
+        (
+            crr_american_price(S, K, T, r + hr, sigma, right, q, steps)
+            - crr_american_price(S, K, T, r - hr, sigma, right, q, steps)
+        )
+        / (2.0 * hr)
+        / 100.0
+    )
+    nan = float("nan")
+    return Greeks(price, float(delta), float(gamma), theta_year / 365.0, vega, rho, nan, nan, nan, nan)

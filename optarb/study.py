@@ -15,14 +15,14 @@ and demonstrated; its numbers say nothing about real markets.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from optarb.arbitrage import ScanConfig, box_rates, scan
+from optarb.arbitrage import ScanConfig, box_rates, fresh, scan
 from optarb.models import ExerciseStyle, OptionsChain
 from optarb.providers.synthetic import make_chain, plant_butterfly, plant_short_box, plant_vertical
 
@@ -33,17 +33,42 @@ class StudyResult:
     snapshots: pd.DataFrame  # one row per snapshot
     box_rates: pd.DataFrame  # one row per snapshot per expiry (European only)
     config: ScanConfig
+    surface: pd.DataFrame = field(default_factory=pd.DataFrame)  # one row per snapshot per expiry: ATM, RR25, BF25
+    vendor: pd.DataFrame = field(default_factory=pd.DataFrame)  # our IV and Greeks next to the source's, per quote
 
     @property
     def synthetic(self) -> bool:
         return bool((self.snapshots["source"] == "synthetic").any())
 
 
-def run(chains: Iterable[OptionsChain], cfg: ScanConfig | None = None) -> StudyResult:
+SURFACE_COLUMNS = ["symbol", "asof", "expiration", "T", "atm_iv", "put25_iv", "call25_iv", "rr25", "bf25", "quotes"]
+
+
+def run(
+    chains: Iterable[OptionsChain],
+    cfg: ScanConfig | None = None,
+    greeks: bool = True,
+    rate: float | None = None,
+) -> StudyResult:
+    """Scan every snapshot. With ``greeks`` on, also fit the IV surface of each snapshot from its own
+    out-of-the-money quotes and, where the source reports Greeks, keep ours next to theirs."""
+    from optarb.greeks import GREEKS, analyze, surface_summary
+
     cfg = cfg or ScanConfig()
     opp_rows, snap_rows, rate_rows = [], [], []
+    surfaces, vendor = [], []
+    vendor_cols = [c for name in ("iv", *GREEKS) for c in (name, f"vendor_{name}")]
     for chain in chains:
         found = scan(chain, cfg)
+        if greeks:
+            df = analyze(fresh(chain, cfg), rate=rate, otm_only=True, spread_iv=False)
+            surf = surface_summary(df)
+            if not surf.empty:
+                surfaces.append(surf.assign(symbol=chain.symbol, asof=chain.asof)[SURFACE_COLUMNS])
+            if not df.empty and df["vendor_iv"].notna().any():
+                vendor.append(
+                    df[["expiration", "strike", "right", *vendor_cols]].assign(symbol=chain.symbol, asof=chain.asof)
+                )
         snap_rows.append(
             {
                 "symbol": chain.symbol,
@@ -90,7 +115,44 @@ def run(chains: Iterable[OptionsChain], cfg: ScanConfig | None = None) -> StudyR
         snapshots=pd.DataFrame(snap_rows),
         box_rates=pd.DataFrame(rate_rows, columns=["symbol", "asof", "expiration", "T", "lend_rate", "borrow_rate"]),
         config=cfg,
+        surface=pd.concat(surfaces, ignore_index=True) if surfaces else pd.DataFrame(columns=SURFACE_COLUMNS),
+        vendor=pd.concat(vendor, ignore_index=True) if vendor else pd.DataFrame(),
     )
+
+
+def surface_over_session(result: StudyResult) -> pd.DataFrame:
+    """Per symbol and expiry: ATM IV at the first and last snapshot, its range, and median RR25 and BF25."""
+    cols = [
+        "symbol",
+        "expiration",
+        "snapshots",
+        "atm_first",
+        "atm_last",
+        "atm_min",
+        "atm_max",
+        "rr25_median",
+        "bf25_median",
+    ]
+    s = result.surface
+    if s.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for (sym, exp), g in s.sort_values("asof").groupby(["symbol", "expiration"]):
+        atm = pd.to_numeric(g["atm_iv"], errors="coerce")
+        rows.append(
+            {
+                "symbol": sym,
+                "expiration": exp,
+                "snapshots": len(g),
+                "atm_first": atm.iloc[0],
+                "atm_last": atm.iloc[-1],
+                "atm_min": atm.min(),
+                "atm_max": atm.max(),
+                "rr25_median": pd.to_numeric(g["rr25"], errors="coerce").median(),
+                "bf25_median": pd.to_numeric(g["bf25"], errors="coerce").median(),
+            }
+        )
+    return pd.DataFrame(rows, columns=cols)
 
 
 def persistence(result: StudyResult) -> pd.DataFrame:
@@ -247,6 +309,32 @@ def write_report(result: StudyResult, out_dir: str | Path) -> Path:
         else eps
     )
     lines += ["## Longest-lived episodes", "", _md_table(longest), ""]
+    if not result.surface.empty:
+        result.surface.to_csv(out / "surface.csv", index=False)
+        lines += [
+            "## Implied volatility surface over the session",
+            "",
+            "Fitted from each snapshot's own out-of-the-money quotes, in vol points. ATM is at the parity-implied",
+            "forward for European chains and the carry-implied forward for American ones. `rr25` is the 25-delta call",
+            "vol minus the 25-delta put vol; `bf25` is their average minus ATM. Blank: no quotes reached 25 delta.",
+            "",
+            _md_table(surface_over_session(result)).replace("| nan ", "|  "),
+            "",
+        ]
+    if not result.vendor.empty:
+        from optarb.greeks import vendor_comparison
+
+        result.vendor.to_csv(out / "vendor_greeks.csv", index=False)
+        lines += [
+            "## Our IV and Greeks against the data source's",
+            "",
+            "Pooled over every out-of-the-money quote both sides priced. A median ratio near 1 means the units and",
+            "conventions agree; near 100 or 0.01 means a unit mismatch, not a pricing gap. Gaps are in the measure's",
+            "own units (IV as a decimal, theta per day, vega and rho per 1 point).",
+            "",
+            _md_table(vendor_comparison(result.vendor), "{:,.4f}"),
+            "",
+        ]
     path = out / "report.md"
     path.write_text("\n".join(lines))
     return path

@@ -53,6 +53,8 @@ class ScanConfig:
     max_spread_pct: float = 100.0
     reference_rate: float | None = None  # funding rate for box_vs_funding; None turns it off
     box_rate_band: float = 0.005  # flag boxes whose net rate beats the reference by more than this
+    min_size: int = 0  # contracts required on the side you trade; only applied when the source reports sizes
+    max_quote_age_seconds: float | None = None  # drop quotes last updated longer than this before the snapshot
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,20 @@ def _usable(q: OptionQuote, action: str, cfg: ScanConfig) -> bool:
         return False
     if q.open_interest < cfg.min_open_interest or q.volume < cfg.min_volume:
         return False
+    if cfg.min_size > 0:
+        size = q.ask_size if action == BUY else q.bid_size
+        if 0 < size < cfg.min_size:
+            return False
     return q.spread_pct <= cfg.max_spread_pct
+
+
+def fresh(chain: OptionsChain, cfg: ScanConfig) -> OptionsChain:
+    """Drop quotes older than ``cfg.max_quote_age_seconds``; quotes with no timestamp are kept."""
+    if cfg.max_quote_age_seconds is None:
+        return chain
+    limit = cfg.max_quote_age_seconds
+    kept = [q for q in chain.quotes if q.quote_time is None or (chain.asof - q.quote_time).total_seconds() <= limit]
+    return chain if len(kept) == len(chain.quotes) else chain.replace_quotes(kept)
 
 
 def _leg(q: OptionQuote, action: str, quantity: int = 1) -> Leg:
@@ -418,6 +433,7 @@ def box_rates(chain: OptionsChain, cfg: ScanConfig) -> list[BoxRate]:
     """
     if chain.exercise_style is not ExerciseStyle.EUROPEAN:
         return []
+    chain = fresh(chain, cfg)
     commission = 4 * cfg.commission_per_contract / CONTRACT_MULTIPLIER  # per share of box
     out = []
     for exp in chain.expirations:
@@ -489,6 +505,7 @@ MODEL_FREE_CHECKS = (strike_monotonicity, vertical_width, butterfly_convexity, b
 def scan(chain: OptionsChain, cfg: ScanConfig | None = None) -> list[Opportunity]:
     """Run every applicable check and return opportunities sorted by net edge, largest first."""
     cfg = cfg or ScanConfig()
+    chain = fresh(chain, cfg)
     found: list[Opportunity] = []
     for check in (*MODEL_FREE_CHECKS, box_vs_funding):
         found.extend(check(chain, cfg))
